@@ -19,9 +19,21 @@ frame is a quarter turn off: x = -sensor y, y = sensor x, z = sensor z (the
 frame pb-os, MaSi and Batocera validated on a Thor). The gyro's zero is
 learned while the device lies still and kept in /var/lib/thor-sensors.
 Around suspend the streams stop (logind delay lock) and start again after.
+
+On only when wanted (2026-10-29): 200 Hz while something can use the motion,
+an emulator on the DSU feed or the Switch Pro identity (the one identity Steam
+reads gyro from); otherwise the two sensor streams are stopped (the hexagonrpcd
+listeners and the uinput device stay, and the saved zero carries over). A new
+DSU client starts them at once; the Switch Pro identity within WATCH_S;
+stopping waits IDLE_AFTER_S. THOR_MOTION_IDLE_HZ picks the idle behaviour:
+0 (default) off, 1-199 a slow stream (the hub never delivers below ~110 Hz, so
+only that many reports a second reach uinput), 200 the old always-200. The zero
+and the drift tracking use the rate actually measured. The mode is logged and
+written to /run/thor-motiond.mode.
 """
 import asyncio
 import fcntl
+import glob
 import importlib.util
 import math
 import os
@@ -36,7 +48,14 @@ probe = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(probe)
 
 NAME = "Thor Motion Sensors"
-RATE = 200
+RATE = 200                                  # the active rate
+IDLE_RATE = int(os.environ.get("THOR_MOTION_IDLE_HZ", "0"))   # 0 = streams off when not wanted
+if not 0 <= IDLE_RATE < RATE:
+    IDLE_RATE = RATE                        # one rate, the pre-2026-10-29 behaviour
+IDLE_AFTER_S = 5.0                          # nothing wanted the motion this long: drop to IDLE_RATE
+WATCH_S = 2.0                               # how often the Switch Pro identity is looked for
+MODE_FILE = "/run/thor-motiond.mode"
+SWITCH_PRO_HID = "/sys/bus/hid/devices/*:057E:2009.*"   # our InputPlumber's switch-pro target, live
 G = 9.80665
 RAD2DEG = 180.0 / math.pi
 ACCEL_RES, GYRO_RES = 8192, 1024
@@ -76,8 +95,9 @@ class DsuServer(asyncio.DatagramProtocol):
     MAC = bytes.fromhex("0254484f5200")       # locally administered, "THOR"
     DSU_SIGN = (1, 1, 1, 1, 1, 1)             # accel x y z, gyro pitch yaw roll
 
-    def __init__(self):
+    def __init__(self, on_new_client=None):
         self.transport, self.clients, self.packet, self.server_id = None, {}, 0, int.from_bytes(os.urandom(4), "little")
+        self.on_new_client = on_new_client
 
     def connection_made(self, transport):
         self.transport = transport
@@ -106,7 +126,15 @@ class DsuServer(asyncio.DatagramProtocol):
             for slot in data[24:24 + max(0, min(count, 4))]:
                 self._send(addr, msg_type, self._slot(slot) + b"\0")
         elif msg_type == self.MSG_DATA:
+            new = addr not in self.clients
             self.clients[addr] = time.monotonic()
+            if new and self.on_new_client:
+                self.on_new_client()
+
+    def live(self, now=None):
+        """A client that asked within 5 s (they re-register about every second)."""
+        now = time.monotonic() if now is None else now
+        return any(now - seen <= 5.0 for seen in self.clients.values())
 
     def send_motion(self, accel_g, gyro_dps):
         if not self.clients:
@@ -187,7 +215,7 @@ class GyroZero:
     def _reset(self):
         self.n, self.sum, self.sq, self.amin, self.amax = 0, [0.0] * 3, [0.0] * 3, [0.0] * 3, [0.0] * 3
 
-    def add(self, w, a):
+    def add(self, w, a, rate=RATE):
         for i in range(3):
             if abs(w[i]) > 6.0:
                 return self._reset()
@@ -198,7 +226,7 @@ class GyroZero:
             if self.amax[i] - self.amin[i] > 0.03:   # noise ~0.02 g
                 return self._reset()
         self.n += 1
-        if self.n < RATE // 2:
+        if self.n < rate // 2:                     # half a second at the live rate
             return
         mean = [s / self.n for s in self.sum]
         if any(self.sq[i] / self.n - mean[i] ** 2 > 0.25 ** 2 for i in range(3)):
@@ -234,9 +262,9 @@ class Steady:
     def reset(self):
         self.d = [0.0, 0.0, 0.0]
 
-    def __call__(self, w):
+    def __call__(self, w, rate=RATE):
         if DRIFT_DPS > 0 and all(abs(x - d) < DRIFT_DPS for x, d in zip(w, self.d)):
-            k = 1.0 / (RATE * DRIFT_TAU_S)
+            k = 1.0 / (rate * DRIFT_TAU_S)
             self.d = [max(-DRIFT_MAX, min(DRIFT_MAX, d + k * (x - d))) for x, d in zip(w, self.d)]
         w = [x - d for x, d in zip(w, self.d)]
         m = math.sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2])
@@ -252,16 +280,92 @@ class Motion:
         self.zero = GyroZero(ZERO_FILE)
         self.steady = Steady()
         self.asleep, self.n = False, 0
+        self.rate, self.why, self.wanted_at = RATE, "start", time.monotonic()
+        self.hz, self.hz_n, self.hz_t, self.emitted = float(RATE), 0, time.monotonic(), 0.0
         self.loop = asyncio.get_event_loop()
 
+    def measure(self, now):
+        """Gyro samples per second as the hub really delivers them, over 1 s windows."""
+        self.hz_n += 1
+        if now - self.hz_t >= 1.0:
+            self.hz = max(1.0, self.hz_n / (now - self.hz_t))
+            self.hz_n, self.hz_t = 0, now
+
+    def emit_due(self, now):
+        """Every sample when active; at idle IDLE_RATE a second on average reach uinput
+        (a schedule, not a minimum gap, so 110 Hz samples do not round it down to 22)."""
+        if self.rate == RATE or not IDLE_RATE:
+            return True
+        if now < self.emitted:
+            return False
+        period = 1.0 / IDLE_RATE
+        self.emitted = (self.emitted if now - self.emitted < period else now) + period
+        return True
+
+    def wanted(self):
+        """Why the motion is wanted at full rate right now, or "" if nothing wants it."""
+        if self.dump or IDLE_RATE >= RATE:
+            return "always"
+        if self.dsu and self.dsu.live():
+            return "dsu"
+        if glob.glob(SWITCH_PRO_HID):
+            return "switch-pro"
+        return ""
+
+    def target_rate(self, now=None):
+        """Up at once, down only after IDLE_AFTER_S with nothing wanting it."""
+        now = time.monotonic() if now is None else now
+        why = self.wanted()
+        if why:
+            self.why, self.wanted_at = why, now
+            return RATE
+        return RATE if now - self.wanted_at < IDLE_AFTER_S else IDLE_RATE
+
+    def write_mode(self):
+        try:
+            with open(MODE_FILE + ".new", "w") as f:
+                state = "active" if self.rate == RATE else "off" if self.rate == 0 else "idle"
+                f.write(f"{self.rate} {state} {self.why if self.rate == RATE else '-'}\n")
+            os.replace(MODE_FILE + ".new", MODE_FILE)
+        except OSError:
+            pass
+
+    def check_rate(self):
+        """Start, stop or restart the two sensor streams for the rate wanted now (the
+        hexagonrpcd listeners stay). A stream that died on its own is health()'s job."""
+        if self.asleep:
+            return
+        rate = self.target_rate()
+        if rate == self.rate:
+            return
+        what = f"wanted ({self.why})" if rate == RATE else "off" if rate == 0 else "idle"
+        log(f"motion {what}: {self.rate} -> {rate} Hz (measured {self.hz:.0f})")
+        self.stop()
+        self.rate, self.hz, self.hz_n, self.hz_t = rate, float(rate), 0, time.monotonic()
+        if not self.start():
+            log("restart at the new rate failed; the health check retries")
+
+    def poke(self):
+        self.loop.call_soon(self.check_rate)
+
+    async def watch_rate(self):
+        while True:
+            await asyncio.sleep(WATCH_S)
+            self.check_rate()
+
     def start(self):
+        if self.target_rate() == 0:
+            self.rate = 0                         # nothing wants the motion: streams stay off
+            self.write_mode()
+            return True
         svc = probe.find_service(timeout=10.0)
         if not svc:
             return False
+        self.rate = self.target_rate()
         try:
             for t in ("accel", "gyro"):
                 c = probe.Client(svc)
-                c.start(t, RATE)
+                c.start(t, self.rate)
                 c.s.setblocking(False)
                 self.clients[t] = c
                 self.loop.add_reader(c.s.fileno(), self.on_data, t)
@@ -269,7 +373,8 @@ class Motion:
             log(f"sensor hub not ready: {e}")
             self.stop()
             return False
-        log(f"streaming accel + gyro at {RATE} Hz from node {svc[0]} port {svc[1]}")
+        log(f"streaming accel + gyro at {self.rate} Hz from node {svc[0]} port {svc[1]}")
+        self.write_mode()
         return True
 
     def stop(self):
@@ -300,21 +405,23 @@ class Motion:
                     self.accel = rotate(v, 1.0 / G)
                 else:
                     w = rotate(v, RAD2DEG)
+                    now = time.monotonic()
+                    self.measure(now)
                     before = self.zero.bias
-                    self.zero.add(w, self.accel)
+                    self.zero.add(w, self.accel, int(self.hz))
                     if self.zero.bias is not before:
                         self.steady.reset()   # a fresh still-window zero already holds the drift
                     w = [x - b for x, b in zip(w, self.zero.bias)]
                     self.n += 1
                     if self.dump:
-                        if self.n % (RATE // 5) == 0:
+                        if self.n % max(1, int(self.hz) // 5) == 0:
                             print("accel %+6.3f %+6.3f %+6.3f g   gyro %+8.2f %+8.2f %+8.2f deg/s   zero %s"
                                   % (*self.accel, *w, " ".join("%+.2f" % b for b in self.zero.bias)), flush=True)
                     else:
-                        if self.dev:
+                        if self.dev and self.emit_due(now):
                             self.dev.emit(self.accel, w)
                         if self.dsu:
-                            self.dsu.send_motion(self.accel, self.steady(w))
+                            self.dsu.send_motion(self.accel, self.steady(w, self.hz))
 
     async def watch_sleep(self):
         """Sensors off before suspend, on after resume (logind delay lock)."""
@@ -367,7 +474,7 @@ class Motion:
             await asyncio.sleep(5)
             if self.asleep:
                 continue
-            if self.n == last and self.clients:
+            if self.n == last and self.clients and self.rate:
                 log("no samples for 5 s: reconnecting")
                 self.stop()
             last = self.n
@@ -382,8 +489,10 @@ async def main():
         m.dev = MotionDevice()
         log(f"created uinput device \"{NAME}\"")
         m.loop.create_task(m.watch_sleep())
-        _, m.dsu = await m.loop.create_datagram_endpoint(DsuServer, local_addr=("127.0.0.1", DsuServer.PORT))
+        _, m.dsu = await m.loop.create_datagram_endpoint(lambda: DsuServer(m.poke), local_addr=("127.0.0.1", DsuServer.PORT))
         log(f"DSU server on 127.0.0.1:{DsuServer.PORT}")
+        log(f"rates: {RATE} Hz when wanted (DSU client or Switch Pro), {IDLE_RATE or 'off'}{' Hz' if IDLE_RATE else ''} otherwise")
+        m.loop.create_task(m.watch_rate())
     await m.keep_streaming()
     try:
         await m.health()

@@ -1,10 +1,11 @@
 # Gyro files
 
-What runs on my Thor to read the motion sensor and feed it to emulators. How it works and what's proven: [docs/gyro.md](../../docs/gyro.md). On 29 October 2026, `thor-motiond`, `thor-sensors` and both service files were byte-for-byte the copies on my Thor, apart from one comment.
+What runs on my Thor to read the motion sensor and feed it to emulators. How it works and what's proven: [docs/gyro.md](../../docs/gyro.md). On 29 October 2026, `thor-motiond` (the on-only-when-wanted version), `thor-sensors` and both service files were byte-for-byte the copies on my Thor, apart from one comment.
 
 | File | What | License |
 |---|---|---|
-| `thor-motiond`, `thor-motiond.service` | The motion daemon: sensor hub to DSU (emulators) and to a uinput motion device (InputPlumber). Runs as a system service. | MIT |
+| `thor-motiond`, `thor-motiond.service` | The motion daemon: sensor hub to DSU (emulators) and to a uinput motion device (InputPlumber). Runs as a system service, and only reads the sensor while a DSU client or the Switch Pro identity wants it. State in `/run/thor-motiond.mode`. | MIT |
+| `tests/test-thor-motiond.py` | Tests for when the streams start and stop, and the rate-aware zero and drift (`python3 tests/test-thor-motiond.py -v`, no sensor needed). | MIT |
 | `thor-motion-config` | Points Azahar, Eden and Dolphin at the DSU feed. Run once, with the emulators closed. | MIT |
 | `thor-sensors`, `thor-sensors.service` | Builds the sensor registry and runs the two `hexagonrpcd` listeners early in boot. A port of pb-os's `sm8550-sensors`, which comes from MaSi's SteamOS-ARM-SM8550. | GPL-2.0 (pb-os's license) |
 | `build-hexagonrpcd.sh` | Builds `hexagonrpcd` and `sscregistrygen` on the Thor from linux-msm/hexagonrpc `dd9ac70` plus the patches below. | MIT |

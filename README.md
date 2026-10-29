@@ -43,7 +43,7 @@ Everything in this table was checked on the device. "Separate review" means an A
 | A live Thor on Test Device Inputs: buttons, D-pad, sticks and an analog trigger fill all light up | Works | Tested by hand: "this screen looks great now. All of the buttons work properly. They light properly. The triggers work properly." |
 | The **icons printed on the Thor's system buttons** in Steam's menus (a house for Home, a triangle for Start, a square for Select) | Works on both identities | Separate review of screenshots against the printed-icon list |
 | The **animated Thor on the game-launch screen** | Works | Separate review of a screenshot taken during a launch |
-| **Gyro in the 3DS emulator** (Azahar on SteamOS, fed over DSU) | Works, on my patched kernel | The gyro moves the view in Ocarina of Time 3D. Drift filtering was added after I saw the view creep in my hands. The sensor streams at about 218 samples a second, and lies flat at about 1 g. |
+| **Gyro in the 3DS emulator** (Azahar on SteamOS, fed over DSU) | Works, on my patched kernel | The gyro moves the view in Ocarina of Time 3D, smoothly in my hands. Drift filtering was added after I saw the view creep. The motion reader only runs while an emulator or Steam can use it, so it costs almost nothing in the menus (measured: 3.7% of a core always-on, 0.04% now). |
 | **Gyro through Steam Input** | Not yet | Steam's test screen shows no gyro on the default identity. Details and limits in [gyro.md](docs/gyro.md). |
 
 Not done, or not checked yet:
@@ -51,7 +51,6 @@ Not done, or not checked yet:
 - Button icons inside games that ask Steam for icon images. Those games read image files that my runtime CSS can't reach, so they still get Steam's standard icons.
 - The Thor drawing on Steam's Calibration screen. It's in the code, but I haven't put it through the same screenshot check.
 - Gyro through Steam Input, and gyro in Eden and Dolphin. The feed is pointed at both, but I've only confirmed it in Azahar.
-- The motion daemon streams all the time and costs about 3.5% of a core on average ([gyro.md](docs/gyro.md)). Streaming only while something listens is planned, not built.
 - Any Thor other than mine (16 GB), and any Steam client newer than the one listed below.
 
 Steam's Test Device Inputs on my Thor, with the Thor drawing in place of Steam's:
