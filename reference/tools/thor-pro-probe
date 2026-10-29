@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Check the virtual Switch Pro Controller (InputPlumber's switch-pro target).
+
+Prints one line: the HID device, the kernel driver bound to it, its hidraw
+node and how many 0x30 full input reports it streamed in one second.
+    bound=nintendo reports_0x30_per_s=250 hid=0003:057E:2009.000A hidraw=/dev/hidraw3
+Reading hidraw needs the seat ACL Steam's udev rules give the logged-in user,
+or root.
+"""
+import glob
+import os
+import select
+import sys
+import time
+
+found = False
+for dev in sorted(glob.glob("/sys/bus/hid/devices/*:057E:2009.*")):
+    found = True
+    hid = os.path.basename(dev)
+    drv = os.path.basename(os.path.realpath(f"{dev}/driver")) if os.path.exists(f"{dev}/driver") else "none"
+    nodes = glob.glob(f"{dev}/hidraw/hidraw*")
+    node = f"/dev/{os.path.basename(nodes[0])}" if nodes else ""
+    count = 0
+    err = ""
+    if node:
+        try:
+            fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+            end = time.monotonic() + 1.0
+            while (left := end - time.monotonic()) > 0:
+                if select.select([fd], [], [], left)[0]:
+                    try:
+                        data = os.read(fd, 64)
+                    except BlockingIOError:
+                        continue
+                    if data[:1] == b"\x30":
+                        count += 1
+            os.close(fd)
+        except OSError as e:
+            err = f" error={e.strerror}"
+    print(f"bound={drv} reports_0x30_per_s={count} hid={hid} hidraw={node or 'none'}{err}")
+if not found:
+    print("no 057E:2009 HID device")
+    sys.exit(1)

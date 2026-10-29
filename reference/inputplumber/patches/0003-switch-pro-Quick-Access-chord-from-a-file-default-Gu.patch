@@ -1,0 +1,121 @@
+From 13380301d7b9a2c547671e805259b59edf242a33 Mon Sep 17 00:00:00 2001
+From: Ryan Zegalia <ryanzegalia@gmail.com>
+Date: Tue, 13 Oct 2026 23:10:13 -0400
+Subject: [PATCH 3/5] switch-pro: Quick Access chord from a file, default Guide
+ + East
+
+Steam ignored Guide + A(south) as the Quick Access chord on the Switch Pro
+identity (it opened the Steam menu): with the Nintendo layout Steam turns on
+for a Pro Controller, Steam's A is the east button (InputPlumber #237). The
+chord is read from /var/lib/thor-inputplumber/switch-pro-qam at each press
+(button names, pressed in order, released in reverse) so it can be tuned
+live; the default is Guide East.
+---
+ src/input/target/switch_pro.rs | 66 +++++++++++++++++++++++-----------
+ 1 file changed, 45 insertions(+), 21 deletions(-)
+
+diff --git a/src/input/target/switch_pro.rs b/src/input/target/switch_pro.rs
+index 50f39ce..f29f78a 100644
+--- a/src/input/target/switch_pro.rs
++++ b/src/input/target/switch_pro.rs
+@@ -19,6 +19,7 @@
+ //! button lands on the Pro Controller button in the same place.
+ use std::{
+     collections::{HashMap, VecDeque},
++    str::FromStr,
+     error::Error,
+     fmt::Debug,
+     fs::File,
+@@ -71,6 +72,15 @@ const MAX_EVENTS_PER_POLL: usize = 32;
+ const TRIGGER_PRESS: f64 = 0.30;
+ const TRIGGER_RELEASE: f64 = 0.20;
+ 
++/// File naming the buttons of the Quick Access chord, e.g. "Guide East" or
++/// "Screenshot" (InputPlumber button names, pressed in order, released in
++/// reverse). Read at each press, so the chord can be changed without a
++/// restart. Without it: Guide + East (Steam's Quick Access chord is Guide + A,
++/// and with the Nintendo layout Steam turns on for a Pro Controller, A is the
++/// east button; InputPlumber issue #237).
++const QAM_CHORD_FILE: &str = "/var/lib/thor-inputplumber/switch-pro-qam";
++const QAM_CHORD_DEFAULT: [GamepadButton; 2] = [GamepadButton::Guide, GamepadButton::East];
++
+ /// Firmware version reported in the device info reply (4.33, a shipping
+ /// Pro Controller firmware).
+ const FIRMWARE_VERSION: [u8; 2] = [0x04, 0x33];
+@@ -552,31 +562,24 @@ impl TargetInputDevice for SwitchProDevice {
+     fn write_event(&mut self, event: NativeEvent) -> Result<(), InputError> {
+         log::trace!("Received event: {event:?}");
+ 
+-        // A Pro Controller has no Quick Access button: send Steam's own
+-        // chord for it, Guide + A.
++        // A Pro Controller has no Quick Access button: send Steam's chord
++        // for it instead (see QAM_CHORD_FILE).
+         // TODO: Remove once we implement target device profiles
+         if event.as_capability() == Capability::Gamepad(Gamepad::Button(GamepadButton::QuickAccess))
+         {
+             let pressed = event.pressed();
+-            let guide = NativeEvent::new(
+-                Capability::Gamepad(Gamepad::Button(GamepadButton::Guide)),
+-                event.get_value(),
+-            );
+-            let south = NativeEvent::new(
+-                Capability::Gamepad(Gamepad::Button(GamepadButton::South)),
+-                event.get_value(),
+-            );
+-            let (guide, south) = if pressed {
+-                let guide = ScheduledNativeEvent::new(guide, Duration::from_millis(0));
+-                let south = ScheduledNativeEvent::new(south, MIN_CHORD_TIME);
+-                (guide, south)
+-            } else {
+-                let guide = ScheduledNativeEvent::new(guide, MIN_CHORD_TIME * 3);
+-                let south = ScheduledNativeEvent::new(south, MIN_CHORD_TIME * 2);
+-                (guide, south)
+-            };
+-            self.queued_events.push(guide);
+-            self.queued_events.push(south);
++            let chord = qam_chord();
++            let n = chord.len() as u32;
++            for (i, button) in chord.into_iter().enumerate() {
++                let i = i as u32;
++                // Press in order 80 ms apart; release in reverse after the last press
++                let delay = if pressed { MIN_CHORD_TIME * i } else { MIN_CHORD_TIME * (2 * n - 1 - i) };
++                let event = NativeEvent::new(
++                    Capability::Gamepad(Gamepad::Button(button)),
++                    event.get_value(),
++                );
++                self.queued_events.push(ScheduledNativeEvent::new(event, delay));
++            }
+             return Ok(());
+         }
+ 
+@@ -726,6 +729,27 @@ impl Debug for SwitchProDevice {
+     }
+ }
+ 
++/// The Quick Access chord: the buttons named in QAM_CHORD_FILE, or the default.
++fn qam_chord() -> Vec<GamepadButton> {
++    let Ok(text) = std::fs::read_to_string(QAM_CHORD_FILE) else {
++        return QAM_CHORD_DEFAULT.to_vec();
++    };
++    let chord: Vec<GamepadButton> = text
++        .split_whitespace()
++        .filter_map(|name| {
++            let button = GamepadButton::from_str(name).ok();
++            if button.is_none() {
++                log::warn!("Unknown button '{name}' in {QAM_CHORD_FILE}");
++            }
++            button
++        })
++        .collect();
++    if chord.is_empty() {
++        return QAM_CHORD_DEFAULT.to_vec();
++    }
++    chord
++}
++
+ /// A normalized stick value (-1.0 to 1.0) as a 12-bit Pro Controller axis.
+ fn stick_value(value: f64) -> u16 {
+     let value = value.clamp(-1.0, 1.0);
+-- 
+2.53.0
+

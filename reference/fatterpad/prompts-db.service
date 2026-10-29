@@ -1,0 +1,8 @@
+[Unit]
+Description=FatterPad: refresh the list of owned games that ship Nintendo prompts (PCGamingWiki)
+Documentation=file:///home/steamos/.local/bin/prompts-db
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/prompts-db update
+Nice=10

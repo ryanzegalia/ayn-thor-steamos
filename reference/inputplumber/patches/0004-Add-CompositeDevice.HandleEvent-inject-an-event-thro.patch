@@ -1,0 +1,65 @@
+From 1410d9e7710decd85b92a3f2b1e031369192487c Mon Sep 17 00:00:00 2001
+From: Ryan Zegalia <ryanzegalia@gmail.com>
+Date: Tue, 13 Oct 2026 23:10:59 -0400
+Subject: [PATCH 4/5] Add CompositeDevice.HandleEvent: inject an event through
+ the device profile
+
+SendEvent writes straight to the targets. HandleEvent sends the event the
+way a source device does (profile translation first), so scripted tests can
+check what a real press produces end to end. Same polkit action as SendEvent.
+---
+ src/dbus/interface/composite_device.rs | 38 ++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/src/dbus/interface/composite_device.rs b/src/dbus/interface/composite_device.rs
+index cb54ef5..85d234e 100644
+--- a/src/dbus/interface/composite_device.rs
++++ b/src/dbus/interface/composite_device.rs
+@@ -291,6 +291,44 @@ impl CompositeDeviceInterface {
+         Ok(())
+     }
+ 
++    /// Like SendEvent, but the event goes through the device profile first,
++    /// the way a source device's events do, so scripted tests see what a real
++    /// button press would produce (e.g. a profile's face-button swap). Takes a
++    /// bool (buttons) or a double (triggers).
++    async fn handle_event(
++        &self,
++        event: String,
++        value: zvariant::Value<'_>,
++        #[zbus(connection)] conn: &Connection,
++        #[zbus(header)] hdr: Header<'_>,
++    ) -> fdo::Result<()> {
++        check_polkit(
++            conn,
++            Some(hdr),
++            "org.shadowblip.Input.CompositeDevice.SendEvent",
++        )
++        .await?;
++        let cap = Capability::from_str(event.as_str()).map_err(|_| {
++            fdo::Error::Failed(format!(
++                "Failed to parse event string {event} into capability."
++            ))
++        })?;
++        let val = match value {
++            zvariant::Value::Bool(v) => InputValue::Bool(v),
++            zvariant::Value::F64(v) => InputValue::Float(v),
++            _ => {
++                return Err(fdo::Error::Failed(
++                    "HandleEvent takes a bool or a double.".to_string(),
++                ))
++            }
++        };
++        self.composite_device
++            .handle_event(NativeEvent::new(cap, val))
++            .await
++            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
++        Ok(())
++    }
++
+     /// Directly write to the composite device's target devices with the given button event list
+     async fn send_button_chord(
+         &self,
+-- 
+2.53.0
+

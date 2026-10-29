@@ -1,0 +1,7 @@
+{
+  "name": "fatterpad",
+  "version": "1.0.0",
+  "description": "Decky plugin: per-game face-button layout on the AYN Thor (dist/index.js is hand-written, no build step)",
+  "private": true,
+  "type": "module"
+}

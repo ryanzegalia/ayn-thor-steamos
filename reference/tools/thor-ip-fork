@@ -1,0 +1,37 @@
+#!/bin/bash
+# Run InputPlumber from our fork build (InputPlumber 0.81.0 + reference/inputplumber/patches) instead of
+# the stock /usr/bin/inputplumber, or go back. Stock is never touched.
+#   thor-ip-fork on [<binary>]   install <binary> (default ~/build/inputplumber-thor/target/release/inputplumber), restart
+#   thor-ip-fork off             remove the override, restart on stock
+#   thor-ip-fork status
+# Restarts only when no game runs (an InputPlumber restart drops the pad for ~2 s).
+set -euo pipefail
+BIN=/var/lib/thor-inputplumber/inputplumber
+DROP=/etc/systemd/system/inputplumber.service.d/90-thor-fork.conf
+busy() { ps -eo args | grep -E "[S]teamLaunch AppId=|[e]den-cli|[e]den-duo" | head -1; }
+restart() {
+    if [ -n "$(busy)" ] && [ "${FORCE:-0}" != 1 ]; then
+        echo "a game is running ($(busy | cut -c1-80)); not restarting (FORCE=1 to override)" >&2; exit 2
+    fi
+    sudo systemctl daemon-reload
+    sudo systemctl restart inputplumber
+    sleep 2
+    systemctl is-active inputplumber
+}
+case "${1:-status}" in
+on)
+    src=${2:-$HOME/build/inputplumber-thor/target/release/inputplumber}
+    sudo install -D -m755 "$src" "$BIN"
+    sudo mkdir -p "$(dirname "$DROP")"
+    printf '%s\n' '# thor-ip-fork: InputPlumber from our fork build. Remove = thor-ip-fork off' \
+        '[Service]' 'ExecStart=' "ExecStart=$BIN" \
+        'Environment=LOG_LEVEL=info,inputplumber::input::target::switch_pro=debug' | sudo tee "$DROP" >/dev/null
+    restart ;;
+off)
+    sudo rm -f "$DROP"
+    restart ;;
+status)
+    systemctl show -p ExecStart --value inputplumber | grep -o 'path=[^ ;]*'
+    [ -x "$BIN" ] && sha256sum "$BIN" | cut -c1-16 ;;
+*) echo "usage: thor-ip-fork on [binary] | off | status" >&2; exit 64 ;;
+esac

@@ -1,0 +1,1261 @@
+From b904e32e28649ee19e580b5b008c69e4454cf4b9 Mon Sep 17 00:00:00 2001
+From: Ryan Zegalia <ryanzegalia@gmail.com>
+Date: Tue, 13 Oct 2026 22:38:22 -0400
+Subject: [PATCH 1/5] Add a switch-pro target: wired Nintendo Switch Pro
+ Controller over uhid
+
+Presents the composite device to Steam and games as a Pro Controller
+(057e:2009, USB), so Steam and controller-type-aware games draw Nintendo
+glyphs. Answers the host protocol Steam (SDL_hidapi_switch.c) and the
+kernel's hid-nintendo run before a Pro Controller streams input: USB 0x80
+status/handshake/baudrate/no-timeout, subcommands device info, input mode,
+SPI flash reads (factory stick + IMU calibration, colours, stick params;
+user calibration reads as erased), SPI writes kept in memory, IMU,
+vibration, player/home lights, regulated voltage; every other subcommand
+is ACKed so no host stalls. Streams the 0x30 full report every 4 ms with
+12-bit sticks and three IMU samples. Rumble (0x01/0x10 bytes 2-9) decodes
+to a GenericRumble event. Face buttons map by label (South=A, East=B,
+West=X, North=Y); QuickAccess = Steam's Guide+A chord; analog triggers
+become digital ZL/ZR with hysteresis.
+---
+ .../schema/composite_device_v1.json           |   1 +
+ .../schema/device_profile_v1.json             |   1 +
+ src/drivers/mod.rs                            |   1 +
+ src/drivers/switch_pro/mod.rs                 | 207 +++++
+ src/drivers/switch_pro/report_descriptor.rs   |  95 +++
+ src/input/target/mod.rs                       |  20 +
+ src/input/target/switch_pro.rs                | 790 ++++++++++++++++++
+ 7 files changed, 1115 insertions(+)
+ create mode 100644 src/drivers/switch_pro/mod.rs
+ create mode 100644 src/drivers/switch_pro/report_descriptor.rs
+ create mode 100644 src/input/target/switch_pro.rs
+
+diff --git a/rootfs/usr/share/inputplumber/schema/composite_device_v1.json b/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
+index c62fc6d..a81cfab 100644
+--- a/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
++++ b/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
+@@ -60,6 +60,7 @@
+               "keyboard",
+               "gamepad",
+               "hori-steam",
++              "switch-pro",
+               "xb360",
+               "xbox-elite",
+               "xbox-series",
+diff --git a/rootfs/usr/share/inputplumber/schema/device_profile_v1.json b/rootfs/usr/share/inputplumber/schema/device_profile_v1.json
+index a814f9a..a7ecaca 100644
+--- a/rootfs/usr/share/inputplumber/schema/device_profile_v1.json
++++ b/rootfs/usr/share/inputplumber/schema/device_profile_v1.json
+@@ -33,6 +33,7 @@
+               "ds5-edge",
+               "gamepad",
+               "hori-steam",
++              "switch-pro",
+               "keyboard",
+               "mouse",
+               "touchpad",
+diff --git a/src/drivers/mod.rs b/src/drivers/mod.rs
+index 5689c75..f94aa94 100644
+--- a/src/drivers/mod.rs
++++ b/src/drivers/mod.rs
+@@ -12,6 +12,7 @@ pub mod oxp_hid;
+ pub mod oxp_tty;
+ pub mod rog_ally;
+ pub mod steam_deck;
++pub mod switch_pro;
+ pub mod ultimate_2;
+ pub mod unified_gamepad;
+ pub mod xpad_uhid;
+diff --git a/src/drivers/switch_pro/mod.rs b/src/drivers/switch_pro/mod.rs
+new file mode 100644
+index 0000000..d03b48b
+--- /dev/null
++++ b/src/drivers/switch_pro/mod.rs
+@@ -0,0 +1,207 @@
++//! Nintendo Switch Pro Controller (USB) protocol constants, for the
++//! `switch-pro` target device. References: dekuNukem
++//! Nintendo_Switch_Reverse_Engineering (bluetooth_hid_notes.md,
++//! bluetooth_hid_subcommands_notes.md, spi_flash_notes.md, USB-HID-Notes.md),
++//! Linux drivers/hid/hid-nintendo.c and SDL's SDL_hidapi_switch.c (the host
++//! side Steam and the kernel run against this device).
++pub mod report_descriptor;
++
++pub const VID: u16 = 0x057e;
++pub const PID: u16 = 0x2009;
++
++/// Every input and output report is 64 bytes including the report id.
++pub const REPORT_SIZE: usize = 64;
++
++// Input report ids (device -> host)
++pub const INPUT_SUBCMD_REPLY: u8 = 0x21;
++pub const INPUT_STANDARD_FULL: u8 = 0x30;
++pub const INPUT_USB_REPLY: u8 = 0x81;
++
++// Output report ids (host -> device)
++pub const OUTPUT_RUMBLE_AND_SUBCMD: u8 = 0x01;
++pub const OUTPUT_RUMBLE_ONLY: u8 = 0x10;
++pub const OUTPUT_USB_CMD: u8 = 0x80;
++
++// USB commands (output report 0x80, byte 1)
++pub const USB_CMD_STATUS: u8 = 0x01;
++pub const USB_CMD_HANDSHAKE: u8 = 0x02;
++pub const USB_CMD_BAUDRATE_3M: u8 = 0x03;
++pub const USB_CMD_NO_TIMEOUT: u8 = 0x04;
++pub const USB_CMD_ALLOW_TIMEOUT: u8 = 0x05;
++
++// Subcommands (output report 0x01, byte 10)
++pub const SUBCMD_DEVICE_INFO: u8 = 0x02;
++pub const SUBCMD_SET_INPUT_MODE: u8 = 0x03;
++pub const SUBCMD_TRIGGER_ELAPSED: u8 = 0x04;
++pub const SUBCMD_SPI_READ: u8 = 0x10;
++pub const SUBCMD_SPI_WRITE: u8 = 0x11;
++pub const SUBCMD_SPI_ERASE: u8 = 0x12;
++pub const SUBCMD_SET_PLAYER_LIGHTS: u8 = 0x30;
++pub const SUBCMD_GET_PLAYER_LIGHTS: u8 = 0x31;
++pub const SUBCMD_SET_HOME_LIGHT: u8 = 0x38;
++pub const SUBCMD_ENABLE_IMU: u8 = 0x40;
++pub const SUBCMD_ENABLE_VIBRATION: u8 = 0x48;
++pub const SUBCMD_GET_REGULATED_VOLTAGE: u8 = 0x50;
++
++/// Device type byte in the USB status reply and the device info reply.
++pub const CONTROLLER_TYPE_PRO: u8 = 0x03;
++
++/// High nibble: battery full (8), not charging. Low nibble: Pro Controller
++/// (connection bits 0), powered by the host (bit 0).
++pub const BATTERY_CONNECTION: u8 = 0x81;
++
++/// Byte 12 of every input report ("vibrator input report"); hosts ignore it.
++pub const VIBRATOR_REPORT: u8 = 0x80;
++
++/// Most bytes one SPI read reply carries.
++pub const SPI_READ_MAX: usize = 0x1d;
++
++/// 12-bit stick axes: the centre and the deflection the factory calibration
++/// below declares, so the host maps -1.0..1.0 onto the full stick range.
++pub const STICK_CENTER: u16 = 0x800;
++pub const STICK_RANGE: u16 = 0x640;
++
++/// 1 G in raw accelerometer units (+-8 G range, sensitivity 0x4000).
++pub const ACCEL_1G: f64 = 4096.0;
++/// Raw gyro units per degree per second (+-2000 dps range, 0.07 dps/LSB).
++pub const GYRO_PER_DPS: f64 = 1.0 / 0.07;
++
++/// Two 12-bit values packed into 3 bytes, the layout of the stick axes in the
++/// input reports and of the stick calibration in SPI flash.
++pub fn pack_12bit_pair(a: u16, b: u16) -> [u8; 3] {
++    [
++        (a & 0xff) as u8,
++        ((a >> 8) & 0x0f) as u8 | (((b & 0x0f) as u8) << 4),
++        ((b >> 4) & 0xff) as u8,
++    ]
++}
++
++/// Byte at `addr` of the controller's SPI flash, as a factory-fresh Pro
++/// Controller with no user calibration reports it. Unlisted addresses read
++/// 0xff (erased flash), which also means "no user calibration" at 0x8010+.
++pub fn spi_flash_byte(addr: u32) -> u8 {
++    // 0x6012: device type
++    if addr == 0x6012 {
++        return CONTROLLER_TYPE_PRO;
++    }
++    // 0x601b: colours are stored in SPI (0x01)
++    if addr == 0x601b {
++        return 0x01;
++    }
++    // 0x6020..0x6038: factory IMU calibration: accel origin (0,0,0), accel
++    // sensitivity 0x4000 x3, gyro origin (0,0,0), gyro sensitivity 0x343b x3
++    if (0x6020..0x6038).contains(&addr) {
++        const IMU: [u8; 24] = [
++            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
++            0x00, 0x40, 0x00, 0x40, 0x00, 0x40, //
++            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
++            0x3b, 0x34, 0x3b, 0x34, 0x3b, 0x34,
++        ];
++        return IMU[(addr - 0x6020) as usize];
++    }
++    // 0x603d..0x604f: factory stick calibration. Left stick: max above
++    // centre, centre, min below centre. Right stick: centre, min below, max
++    // above (the right stick's order differs on purpose).
++    if (0x603d..0x604f).contains(&addr) {
++        let range = pack_12bit_pair(STICK_RANGE, STICK_RANGE);
++        let center = pack_12bit_pair(STICK_CENTER, STICK_CENTER);
++        let mut cal = [0u8; 18];
++        cal[0..3].copy_from_slice(&range);
++        cal[3..6].copy_from_slice(&center);
++        cal[6..9].copy_from_slice(&range);
++        cal[9..12].copy_from_slice(&center);
++        cal[12..15].copy_from_slice(&range);
++        cal[15..18].copy_from_slice(&range);
++        return cal[(addr - 0x603d) as usize];
++    }
++    // 0x6050..0x605c: body, buttons, left grip, right grip colours (RGB)
++    if (0x6050..0x605c).contains(&addr) {
++        const COLORS: [u8; 12] = [
++            0x32, 0x32, 0x32, // body: dark grey
++            0xff, 0xff, 0xff, // buttons: white
++            0x1e, 0x1e, 0x1e, // left grip
++            0x1e, 0x1e, 0x1e, // right grip
++        ];
++        return COLORS[(addr - 0x6050) as usize];
++    }
++    // 0x6080..0x6086: six-axis horizontal offsets of a Pro Controller
++    if (0x6080..0x6086).contains(&addr) {
++        const OFFSETS: [u8; 6] = [0x50, 0xfd, 0x00, 0x00, 0xc6, 0x0f];
++        return OFFSETS[(addr - 0x6080) as usize];
++    }
++    // 0x6086..0x6098 and 0x6098..0x60aa: left and right stick parameters
++    // (dead zone, range ratio), as factory Pro Controllers ship them
++    if (0x6086..0x60aa).contains(&addr) {
++        const PARAMS: [u8; 18] = [
++            0x0f, 0x30, 0x61, 0x96, 0x30, 0xf3, 0xd4, 0x14, 0x54, //
++            0x41, 0x15, 0x54, 0xc7, 0x79, 0x9c, 0x33, 0x36, 0x63,
++        ];
++        return PARAMS[((addr - 0x6086) % 18) as usize];
++    }
++    0xff
++}
++
++/// Rumble amplitude in thousandths for an encoded amplitude index (0-100),
++/// following the shape of hid-nintendo's joycon_rumble_amplitudes table
++/// (index 1 = 10, index 16 = 117, index 100 = 1003).
++pub fn rumble_amplitude_permille(index: u16) -> f64 {
++    match index {
++        0 => 0.0,
++        1..=15 => 10.0 * (112.0f64 / 10.0).powf((index - 1) as f64 / 14.0),
++        _ => 117.0 * (1003.0f64 / 117.0).powf((index.min(100) - 16) as f64 / 84.0),
++    }
++}
++
++/// (high band, low band) amplitude indexes of one actuator's 4 rumble bytes.
++/// High band: byte 1 bits 1-7. Low band: byte 3 minus 0x40, doubled, plus
++/// byte 2 bit 7. Neutral rumble (00 01 40 40) decodes to (0, 0).
++pub fn decode_rumble(side: &[u8]) -> (u16, u16) {
++    if side.len() < 4 {
++        return (0, 0);
++    }
++    let high = (side[1] >> 1) as u16;
++    let low = if side[3] >= 0x40 {
++        (side[3] - 0x40) as u16 * 2 + (side[2] >> 7) as u16
++    } else {
++        0
++    };
++    (high.min(100), low.min(100))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn packs_stick_axes() {
++        // centre 0x800 both axes
++        assert_eq!(pack_12bit_pair(0x800, 0x800), [0x00, 0x08, 0x80]);
++        assert_eq!(pack_12bit_pair(0x640, 0x640), [0x40, 0x06, 0x64]);
++        assert_eq!(pack_12bit_pair(0xfff, 0x000), [0xff, 0x0f, 0x00]);
++        assert_eq!(pack_12bit_pair(0x000, 0xfff), [0x00, 0xf0, 0xff]);
++    }
++
++    #[test]
++    fn spi_has_calibration() {
++        // left stick factory cal: range, centre, range
++        let left: Vec<u8> = (0x603d..0x6046).map(spi_flash_byte).collect();
++        assert_eq!(left, [0x40, 0x06, 0x64, 0x00, 0x08, 0x80, 0x40, 0x06, 0x64]);
++        // right stick factory cal: centre, range, range
++        let right: Vec<u8> = (0x6046..0x604f).map(spi_flash_byte).collect();
++        assert_eq!(right, [0x00, 0x08, 0x80, 0x40, 0x06, 0x64, 0x40, 0x06, 0x64]);
++        // no user calibration
++        assert_eq!(spi_flash_byte(0x8010), 0xff);
++        assert_eq!(spi_flash_byte(0x6012), CONTROLLER_TYPE_PRO);
++    }
++
++    #[test]
++    fn decodes_rumble() {
++        assert_eq!(decode_rumble(&[0x00, 0x01, 0x40, 0x40]), (0, 0));
++        // index 1 low band = 0x8040, index 100 high band = 0xc8
++        assert_eq!(decode_rumble(&[0x74, 0xc8, 0xbd, 0x40]), (100, 1));
++        assert_eq!(decode_rumble(&[0x74, 0x00, 0x3d, 0x72]), (0, 100));
++        assert_eq!(rumble_amplitude_permille(0), 0.0);
++        assert!((rumble_amplitude_permille(100) - 1003.0).abs() < 0.5);
++        assert!((rumble_amplitude_permille(16) - 117.0).abs() < 0.5);
++    }
++}
+diff --git a/src/drivers/switch_pro/report_descriptor.rs b/src/drivers/switch_pro/report_descriptor.rs
+new file mode 100644
+index 0000000..7952b01
+--- /dev/null
++++ b/src/drivers/switch_pro/report_descriptor.rs
+@@ -0,0 +1,95 @@
++/// USB HID report descriptor of the Nintendo Switch Pro Controller (057e:2009).
++/// From InputPlumber commit 9fd63d7 (Switch source driver, William Edwards).
++pub const REPORT_DESCRIPTOR: [u8; 203] = [
++    0x05, 0x01, // Usage Page (Generic Desktop)        0
++    0x15, 0x00, // Logical Minimum (0)                 2
++    0x09, 0x04, // Usage (Joystick)                    4
++    0xa1, 0x01, // Collection (Application)            6
++    0x85, 0x30, //  Report ID (48)                     8
++    0x05, 0x01, //  Usage Page (Generic Desktop)       10
++    0x05, 0x09, //  Usage Page (Button)                12
++    0x19, 0x01, //  Usage Minimum (1)                  14
++    0x29, 0x0a, //  Usage Maximum (10)                 16
++    0x15, 0x00, //  Logical Minimum (0)                18
++    0x25, 0x01, //  Logical Maximum (1)                20
++    0x75, 0x01, //  Report Size (1)                    22
++    0x95, 0x0a, //  Report Count (10)                  24
++    0x55, 0x00, //  Unit Exponent (0)                  26
++    0x65, 0x00, //  Unit (None)                        28
++    0x81, 0x02, //  Input (Data,Var,Abs)               30
++    0x05, 0x09, //  Usage Page (Button)                32
++    0x19, 0x0b, //  Usage Minimum (11)                 34
++    0x29, 0x0e, //  Usage Maximum (14)                 36
++    0x15, 0x00, //  Logical Minimum (0)                38
++    0x25, 0x01, //  Logical Maximum (1)                40
++    0x75, 0x01, //  Report Size (1)                    42
++    0x95, 0x04, //  Report Count (4)                   44
++    0x81, 0x02, //  Input (Data,Var,Abs)               46
++    0x75, 0x01, //  Report Size (1)                    48
++    0x95, 0x02, //  Report Count (2)                   50
++    0x81, 0x03, //  Input (Cnst,Var,Abs)               52
++    0x0b, 0x01, 0x00, 0x01, 0x00, //  Usage (Vendor Usage 0x10001)       54
++    0xa1, 0x00, //  Collection (Physical)              59
++    0x0b, 0x30, 0x00, 0x01, 0x00, //   Usage (Vendor Usage 0x10030)      61
++    0x0b, 0x31, 0x00, 0x01, 0x00, //   Usage (Vendor Usage 0x10031)      66
++    0x0b, 0x32, 0x00, 0x01, 0x00, //   Usage (Vendor Usage 0x10032)      71
++    0x0b, 0x35, 0x00, 0x01, 0x00, //   Usage (Vendor Usage 0x10035)      76
++    0x15, 0x00, //   Logical Minimum (0)               81
++    0x27, 0xff, 0xff, 0x00, 0x00, //   Logical Maximum (65535)           83
++    0x75, 0x10, //   Report Size (16)                  88
++    0x95, 0x04, //   Report Count (4)                  90
++    0x81, 0x02, //   Input (Data,Var,Abs)              92
++    0xc0, //  End Collection                     94
++    0x0b, 0x39, 0x00, 0x01, 0x00, //  Usage (Vendor Usage 0x10039)       95
++    0x15, 0x00, //  Logical Minimum (0)                100
++    0x25, 0x07, //  Logical Maximum (7)                102
++    0x35, 0x00, //  Physical Minimum (0)               104
++    0x46, 0x3b, 0x01, //  Physical Maximum (315)             106
++    0x65, 0x14, //  Unit (EnglishRotation: deg)        109
++    0x75, 0x04, //  Report Size (4)                    111
++    0x95, 0x01, //  Report Count (1)                   113
++    0x81, 0x02, //  Input (Data,Var,Abs)               115
++    0x05, 0x09, //  Usage Page (Button)                117
++    0x19, 0x0f, //  Usage Minimum (15)                 119
++    0x29, 0x12, //  Usage Maximum (18)                 121
++    0x15, 0x00, //  Logical Minimum (0)                123
++    0x25, 0x01, //  Logical Maximum (1)                125
++    0x75, 0x01, //  Report Size (1)                    127
++    0x95, 0x04, //  Report Count (4)                   129
++    0x81, 0x02, //  Input (Data,Var,Abs)               131
++    0x75, 0x08, //  Report Size (8)                    133
++    0x95, 0x34, //  Report Count (52)                  135
++    0x81, 0x03, //  Input (Cnst,Var,Abs)               137
++    0x06, 0x00, 0xff, //  Usage Page (Vendor Defined Page 1) 139
++    0x85, 0x21, //  Report ID (33)                     142
++    0x09, 0x01, //  Usage (Vendor Usage 1)             144
++    0x75, 0x08, //  Report Size (8)                    146
++    0x95, 0x3f, //  Report Count (63)                  148
++    0x81, 0x03, //  Input (Cnst,Var,Abs)               150
++    0x85, 0x81, //  Report ID (129)                    152
++    0x09, 0x02, //  Usage (Vendor Usage 2)             154
++    0x75, 0x08, //  Report Size (8)                    156
++    0x95, 0x3f, //  Report Count (63)                  158
++    0x81, 0x03, //  Input (Cnst,Var,Abs)               160
++    0x85, 0x01, //  Report ID (1)                      162
++    0x09, 0x03, //  Usage (Vendor Usage 0x03)          164
++    0x75, 0x08, //  Report Size (8)                    166
++    0x95, 0x3f, //  Report Count (63)                  168
++    0x91, 0x83, //  Output (Cnst,Var,Abs,Vol)          170
++    0x85, 0x10, //  Report ID (16)                     172
++    0x09, 0x04, //  Usage (Vendor Usage 0x04)          174
++    0x75, 0x08, //  Report Size (8)                    176
++    0x95, 0x3f, //  Report Count (63)                  178
++    0x91, 0x83, //  Output (Cnst,Var,Abs,Vol)          180
++    0x85, 0x80, //  Report ID (128)                    182
++    0x09, 0x05, //  Usage (Vendor Usage 0x05)          184
++    0x75, 0x08, //  Report Size (8)                    186
++    0x95, 0x3f, //  Report Count (63)                  188
++    0x91, 0x83, //  Output (Cnst,Var,Abs,Vol)          190
++    0x85, 0x82, //  Report ID (130)                    192
++    0x09, 0x06, //  Usage (Vendor Usage 0x06)          194
++    0x75, 0x08, //  Report Size (8)                    196
++    0x95, 0x3f, //  Report Count (63)                  198
++    0x91, 0x83, //  Output (Cnst,Var,Abs,Vol)          200
++    0xc0, // End Collection                      202
++];
+diff --git a/src/input/target/mod.rs b/src/input/target/mod.rs
+index 873b0a8..5800bb4 100644
+--- a/src/input/target/mod.rs
++++ b/src/input/target/mod.rs
+@@ -8,6 +8,7 @@ pub mod keyboard;
+ pub mod mouse;
+ pub mod steam_deck;
+ pub mod steam_deck_uhid;
++pub mod switch_pro;
+ pub mod touchpad;
+ pub mod touchscreen;
+ pub mod ulitmate_2;
+@@ -25,6 +26,7 @@ use std::{
+ 
+ use debug::DebugDevice;
+ use horipad_steam::HoripadSteamDevice;
++use switch_pro::SwitchProDevice;
+ use steam_deck_uhid::SteamDeckUhidDevice;
+ use thiserror::Error;
+ use tokio::{
+@@ -199,6 +201,11 @@ impl TargetDeviceTypeId {
+                 name: "HORI CO.,LTD. HORIPAD STEAM",
+                 device_class: TargetDeviceClass::Gamepad,
+             },
++            TargetDeviceTypeId {
++                id: "switch-pro",
++                name: "Nintendo Co., Ltd. Pro Controller",
++                device_class: TargetDeviceClass::Gamepad,
++            },
+             TargetDeviceTypeId {
+                 id: "8bitdo-u2",
+                 name: "8BitDo Ultimate 2 Wireless Controller",
+@@ -794,6 +801,7 @@ pub enum TargetDevice {
+     Debug(TargetDriver<DebugDevice>),
+     DualSense(TargetDriver<DualSenseDevice>),
+     HoripadSteam(TargetDriver<HoripadSteamDevice>),
++    SwitchPro(TargetDriver<SwitchProDevice>),
+     Keyboard(TargetDriver<KeyboardDevice>),
+     Mouse(TargetDriver<MouseDevice>),
+     SteamDeck(TargetDriver<SteamDeckDevice>),
+@@ -876,6 +884,15 @@ impl TargetDevice {
+                 let driver = TargetDriver::new_with_options(id, device, dbus, options);
+                 Ok(Self::HoripadSteam(driver))
+             }
++            "switch-pro" => {
++                let device = SwitchProDevice::new()?;
++                let options = TargetDriverOptions {
++                    poll_rate: Duration::from_millis(2),
++                    buffer_size: 2048,
++                };
++                let driver = TargetDriver::new_with_options(id, device, dbus, options);
++                Ok(Self::SwitchPro(driver))
++            }
+             "8bitdo-u2" => {
+                 let device = Ultimate2WirelessDevice::new()?;
+                 let options = TargetDriverOptions {
+@@ -949,6 +966,7 @@ impl TargetDevice {
+                 "ds5-edge-bt".try_into().unwrap(),
+             ],
+             TargetDevice::HoripadSteam(_) => vec!["hori-steam".try_into().unwrap()],
++            TargetDevice::SwitchPro(_) => vec!["switch-pro".try_into().unwrap()],
+             TargetDevice::Ultimate2Wireless(_) => vec!["8bitdo-u2".try_into().unwrap()],
+             TargetDevice::Keyboard(_) => vec!["keyboard".try_into().unwrap()],
+             TargetDevice::Mouse(_) => vec!["mouse".try_into().unwrap()],
+@@ -976,6 +994,7 @@ impl TargetDevice {
+             TargetDevice::Debug(device) => Some(device.client()),
+             TargetDevice::DualSense(device) => Some(device.client()),
+             TargetDevice::HoripadSteam(device) => Some(device.client()),
++            TargetDevice::SwitchPro(device) => Some(device.client()),
+             TargetDevice::Ultimate2Wireless(device) => Some(device.client()),
+             TargetDevice::Keyboard(device) => Some(device.client()),
+             TargetDevice::Mouse(device) => Some(device.client()),
+@@ -996,6 +1015,7 @@ impl TargetDevice {
+             TargetDevice::Debug(device) => device.run().await,
+             TargetDevice::DualSense(device) => device.run().await,
+             TargetDevice::HoripadSteam(device) => device.run().await,
++            TargetDevice::SwitchPro(device) => device.run().await,
+             TargetDevice::Ultimate2Wireless(device) => device.run().await,
+             TargetDevice::Keyboard(device) => device.run().await,
+             TargetDevice::Mouse(device) => device.run().await,
+diff --git a/src/input/target/switch_pro.rs b/src/input/target/switch_pro.rs
+new file mode 100644
+index 0000000..b8f11b3
+--- /dev/null
++++ b/src/input/target/switch_pro.rs
+@@ -0,0 +1,790 @@
++//! Emulates a wired Nintendo Switch Pro Controller as a target input device
++//! using uhid, so Steam and games that read the controller type show
++//! Nintendo button glyphs.
++//!
++//! A Pro Controller only reports input after a host sets it up, so this target
++//! answers the host side of the protocol: the USB 0x80 commands, the 0x01
++//! subcommands (device info, SPI flash reads with the stick and IMU
++//! calibration, input mode, IMU, vibration, lights), and then streams the
++//! 0x30 full input report. Two hosts run that setup against it: Steam (its
++//! Switch driver, the same one as SDL_hidapi_switch.c) and the kernel's
++//! hid-nintendo driver, which binds to any USB 057e:2009 device. hid-nintendo
++//! then adds its own "Nintendo Switch Pro Controller" event devices; InputPlumber
++//! skips them as virtual, and Steam tells the games it launches to ignore them.
++//!
++//! Face buttons map by label: InputPlumber's South/East/West/North are the
++//! Xbox A/B/X/Y, and a Pro Controller's A/B/X/Y carry the same letters. On a
++//! handheld whose capability map sends the printed Nintendo letters (the AYN
++//! Thor's ayn_mcu_nintendo: printed A on the right = South), each printed
++//! button lands on the Pro Controller button in the same place.
++use std::{
++    collections::{HashMap, VecDeque},
++    error::Error,
++    fmt::Debug,
++    fs::File,
++    io::ErrorKind,
++    time::{Duration, Instant},
++};
++
++use uhid_virt::{Bus, CreateParams, StreamError, UHIDDevice};
++
++use crate::{
++    drivers::switch_pro::{
++        decode_rumble, pack_12bit_pair, report_descriptor::REPORT_DESCRIPTOR,
++        rumble_amplitude_permille, spi_flash_byte, ACCEL_1G, BATTERY_CONNECTION,
++        CONTROLLER_TYPE_PRO, GYRO_PER_DPS, INPUT_STANDARD_FULL, INPUT_SUBCMD_REPLY,
++        INPUT_USB_REPLY, OUTPUT_RUMBLE_AND_SUBCMD, OUTPUT_RUMBLE_ONLY, OUTPUT_USB_CMD, PID,
++        REPORT_SIZE, SPI_READ_MAX, STICK_CENTER, STICK_RANGE, SUBCMD_DEVICE_INFO,
++        SUBCMD_ENABLE_IMU, SUBCMD_GET_PLAYER_LIGHTS, SUBCMD_GET_REGULATED_VOLTAGE,
++        SUBCMD_SET_INPUT_MODE, SUBCMD_SET_PLAYER_LIGHTS, SUBCMD_SPI_ERASE, SUBCMD_SPI_READ,
++        SUBCMD_SPI_WRITE, SUBCMD_TRIGGER_ELAPSED, USB_CMD_ALLOW_TIMEOUT, USB_CMD_BAUDRATE_3M,
++        USB_CMD_HANDSHAKE, USB_CMD_NO_TIMEOUT, USB_CMD_STATUS, VIBRATOR_REPORT, VID,
++    },
++    input::{
++        capability::{Capability, Gamepad, GamepadAxis, GamepadButton, GamepadTrigger},
++        composite_device::client::CompositeDeviceClient,
++        event::{
++            native::{NativeEvent, ScheduledNativeEvent},
++            value::InputValue,
++        },
++        output_capability::OutputCapability,
++        output_event::OutputEvent,
++    },
++};
++
++use super::{InputError, OutputError, TargetInputDevice, TargetOutputDevice};
++
++/// The minimum interval between button events must wait between
++/// each other for chords.
++const MIN_CHORD_TIME: Duration = Duration::from_millis(80);
++
++/// Full input reports go out at most this often (a wired Pro Controller
++/// streams every 8 ms; twice that rate keeps input latency down).
++const REPORT_INTERVAL: Duration = Duration::from_millis(4);
++
++/// Most uhid events handled in one poll, so a burst cannot starve input.
++const MAX_EVENTS_PER_POLL: usize = 32;
++
++/// An analog trigger counts as pressed above this and released below the
++/// lower value (a Pro Controller's ZL/ZR are digital).
++const TRIGGER_PRESS: f64 = 0.30;
++const TRIGGER_RELEASE: f64 = 0.20;
++
++/// Firmware version reported in the device info reply (4.33, a shipping
++/// Pro Controller firmware).
++const FIRMWARE_VERSION: [u8; 2] = [0x04, 0x33];
++
++/// Controller state, in Pro Controller terms.
++#[derive(Debug, Clone, Copy)]
++struct ControllerState {
++    a: bool,
++    b: bool,
++    x: bool,
++    y: bool,
++    l: bool,
++    r: bool,
++    zl_button: bool,
++    zr_button: bool,
++    zl_analog: bool,
++    zr_analog: bool,
++    minus: bool,
++    plus: bool,
++    home: bool,
++    capture: bool,
++    l_stick: bool,
++    r_stick: bool,
++    up: bool,
++    down: bool,
++    left: bool,
++    right: bool,
++    left_stick: (u16, u16),
++    right_stick: (u16, u16),
++    accel: [i16; 3],
++    gyro: [i16; 3],
++}
++
++impl Default for ControllerState {
++    fn default() -> Self {
++        Self {
++            a: false,
++            b: false,
++            x: false,
++            y: false,
++            l: false,
++            r: false,
++            zl_button: false,
++            zr_button: false,
++            zl_analog: false,
++            zr_analog: false,
++            minus: false,
++            plus: false,
++            home: false,
++            capture: false,
++            l_stick: false,
++            r_stick: false,
++            up: false,
++            down: false,
++            left: false,
++            right: false,
++            left_stick: (STICK_CENTER, STICK_CENTER),
++            right_stick: (STICK_CENTER, STICK_CENTER),
++            // Lying flat: gravity on Z
++            accel: [0, 0, ACCEL_1G as i16],
++            gyro: [0, 0, 0],
++        }
++    }
++}
++
++impl ControllerState {
++    /// The three button bytes of an input report (right, shared, left).
++    fn buttons(&self) -> [u8; 3] {
++        let zr = self.zr_button || self.zr_analog;
++        let zl = self.zl_button || self.zl_analog;
++        let right = self.y as u8
++            | (self.x as u8) << 1
++            | (self.b as u8) << 2
++            | (self.a as u8) << 3
++            | (self.r as u8) << 6
++            | (zr as u8) << 7;
++        let shared = self.minus as u8
++            | (self.plus as u8) << 1
++            | (self.r_stick as u8) << 2
++            | (self.l_stick as u8) << 3
++            | (self.home as u8) << 4
++            | (self.capture as u8) << 5;
++        let left = self.down as u8
++            | (self.up as u8) << 1
++            | (self.right as u8) << 2
++            | (self.left as u8) << 3
++            | (self.l as u8) << 6
++            | (zl as u8) << 7;
++        [right, shared, left]
++    }
++}
++
++/// The [SwitchProDevice] is a target input device implementation that emulates
++/// a wired Nintendo Switch Pro Controller using uhid.
++pub struct SwitchProDevice {
++    device: UHIDDevice<File>,
++    state: ControllerState,
++    timer: u8,
++    mac: [u8; 6],
++    /// Full input reports flow once a host set the input mode or ended the
++    /// USB handshake, like a real controller.
++    streaming: bool,
++    imu_enabled: bool,
++    player_lights: u8,
++    replies: VecDeque<[u8; REPORT_SIZE]>,
++    /// SPI flash bytes a host wrote (user calibration), read back on request.
++    spi_writes: HashMap<u32, u8>,
++    /// Last rumble sent to the source devices: (weak, strong).
++    rumble: (u16, u16),
++    last_report: Instant,
++    write_errors: u64,
++    queued_events: Vec<ScheduledNativeEvent>,
++}
++
++impl SwitchProDevice {
++    pub fn new() -> Result<Self, Box<dyn Error>> {
++        let device = SwitchProDevice::create_virtual_device()?;
++        Ok(Self {
++            device,
++            state: ControllerState::default(),
++            timer: 0,
++            mac: device_mac(),
++            streaming: false,
++            imu_enabled: false,
++            player_lights: 0,
++            replies: VecDeque::new(),
++            spi_writes: HashMap::new(),
++            rumble: (0, 0),
++            last_report: Instant::now(),
++            write_errors: 0,
++            queued_events: Vec::new(),
++        })
++    }
++
++    /// Create the virtual device to emulate
++    fn create_virtual_device() -> Result<UHIDDevice<File>, Box<dyn Error>> {
++        let device = UHIDDevice::create(CreateParams {
++            name: String::from("Nintendo Co., Ltd. Pro Controller"),
++            phys: String::from(""),
++            uniq: String::from(""),
++            bus: Bus::USB,
++            vendor: VID as u32,
++            product: PID as u32,
++            version: 0x0200,
++            country: 0,
++            rd_data: REPORT_DESCRIPTOR.to_vec(),
++        })?;
++
++        Ok(device)
++    }
++
++    /// Write one input report; a failure is logged, never fatal (a poll
++    /// error would stop the target).
++    fn write_report(&mut self, report: &[u8; REPORT_SIZE]) {
++        if let Err(e) = self.device.write(report) {
++            self.write_errors += 1;
++            if self.write_errors == 1 || self.write_errors % 1000 == 0 {
++                log::warn!(
++                    "Failed to write Switch Pro report 0x{:02x} ({} failures): {e:?}",
++                    report[0],
++                    self.write_errors
++                );
++            }
++        }
++    }
++
++    /// Report id, timer, battery, buttons, sticks: the first 13 bytes every
++    /// input report shares.
++    fn base_report(&mut self, id: u8) -> [u8; REPORT_SIZE] {
++        let mut report = [0u8; REPORT_SIZE];
++        self.timer = self.timer.wrapping_add(1);
++        report[0] = id;
++        report[1] = self.timer;
++        report[2] = BATTERY_CONNECTION;
++        report[3..6].copy_from_slice(&self.state.buttons());
++        let (lx, ly) = self.state.left_stick;
++        let (rx, ry) = self.state.right_stick;
++        report[6..9].copy_from_slice(&pack_12bit_pair(lx, ly));
++        report[9..12].copy_from_slice(&pack_12bit_pair(rx, ry));
++        report[12] = VIBRATOR_REPORT;
++        report
++    }
++
++    /// The 0x30 standard full input report, with three IMU samples when the
++    /// host enabled the IMU.
++    fn full_report(&mut self) -> [u8; REPORT_SIZE] {
++        let mut report = self.base_report(INPUT_STANDARD_FULL);
++        if self.imu_enabled {
++            let mut sample = [0u8; 12];
++            for (i, value) in self.state.accel.iter().chain(self.state.gyro.iter()).enumerate() {
++                sample[i * 2..i * 2 + 2].copy_from_slice(&value.to_le_bytes());
++            }
++            for n in 0..3 {
++                report[13 + n * 12..25 + n * 12].copy_from_slice(&sample);
++            }
++        }
++        report
++    }
++
++    /// Queue a 0x21 subcommand reply.
++    fn reply_subcommand(&mut self, subcmd: u8, ack: u8, data: &[u8]) {
++        let mut report = self.base_report(INPUT_SUBCMD_REPLY);
++        report[13] = ack;
++        report[14] = subcmd;
++        let len = data.len().min(REPORT_SIZE - 15);
++        report[15..15 + len].copy_from_slice(&data[..len]);
++        self.replies.push_back(report);
++    }
++
++    /// Queue a 0x81 USB command reply.
++    fn reply_usb(&mut self, cmd: u8, data: &[u8]) {
++        let mut report = [0u8; REPORT_SIZE];
++        report[0] = INPUT_USB_REPLY;
++        report[1] = cmd;
++        let len = data.len().min(REPORT_SIZE - 2);
++        report[2..2 + len].copy_from_slice(&data[..len]);
++        self.replies.push_back(report);
++    }
++
++    /// Handle a USB command (output report 0x80).
++    fn handle_usb_command(&mut self, data: &[u8]) {
++        let Some(&cmd) = data.get(1) else {
++            return;
++        };
++        log::debug!("Switch Pro USB command 0x{cmd:02x}");
++        match cmd {
++            USB_CMD_STATUS => {
++                // 00, device type, MAC address little endian
++                let mut status = vec![0x00, CONTROLLER_TYPE_PRO];
++                status.extend(self.mac.iter().rev());
++                self.reply_usb(cmd, &status);
++            }
++            USB_CMD_HANDSHAKE | USB_CMD_BAUDRATE_3M => self.reply_usb(cmd, &[]),
++            // HID-only mode from now on: no reply, input starts flowing
++            USB_CMD_NO_TIMEOUT => self.streaming = true,
++            USB_CMD_ALLOW_TIMEOUT => (),
++            _ => log::debug!("Unhandled Switch Pro USB command 0x{cmd:02x}"),
++        }
++    }
++
++    /// Handle a subcommand (output report 0x01, byte 10; arguments from 11).
++    fn handle_subcommand(&mut self, data: &[u8]) {
++        let Some(&subcmd) = data.get(10) else {
++            return;
++        };
++        let args = data.get(11..).unwrap_or(&[]);
++        log::debug!("Switch Pro subcommand 0x{subcmd:02x} args {:02x?}", &args[..args.len().min(8)]);
++        match subcmd {
++            SUBCMD_DEVICE_INFO => {
++                // firmware, type, 02, MAC big endian, 01, 01 (colours in SPI)
++                let mut info = FIRMWARE_VERSION.to_vec();
++                info.extend([CONTROLLER_TYPE_PRO, 0x02]);
++                info.extend(self.mac);
++                info.extend([0x01, 0x01]);
++                self.reply_subcommand(subcmd, 0x82, &info);
++            }
++            SUBCMD_SET_INPUT_MODE => {
++                if let Some(&mode) = args.first() {
++                    log::debug!("Switch Pro input mode 0x{mode:02x}");
++                    if mode == INPUT_STANDARD_FULL || mode == 0x31 {
++                        self.streaming = true;
++                    }
++                }
++                self.reply_subcommand(subcmd, 0x80, &[]);
++            }
++            SUBCMD_TRIGGER_ELAPSED => self.reply_subcommand(subcmd, 0x83, &[0u8; 14]),
++            SUBCMD_SPI_READ => {
++                if args.len() < 5 {
++                    self.reply_subcommand(subcmd, 0x80, &[]);
++                    return;
++                }
++                let addr = u32::from_le_bytes([args[0], args[1], args[2], args[3]]);
++                let len = (args[4] as usize).min(SPI_READ_MAX);
++                let mut reply = args[0..4].to_vec();
++                reply.push(len as u8);
++                for offset in 0..len as u32 {
++                    let at = addr.wrapping_add(offset);
++                    let byte = self.spi_writes.get(&at).copied().unwrap_or(spi_flash_byte(at));
++                    reply.push(byte);
++                }
++                self.reply_subcommand(subcmd, 0x90, &reply);
++            }
++            SUBCMD_SPI_WRITE => {
++                // address (4 LE), length, data: kept in memory only
++                if args.len() >= 5 {
++                    let addr = u32::from_le_bytes([args[0], args[1], args[2], args[3]]);
++                    let len = (args[4] as usize).min(args.len() - 5);
++                    for (offset, byte) in args[5..5 + len].iter().enumerate() {
++                        self.spi_writes.insert(addr.wrapping_add(offset as u32), *byte);
++                    }
++                }
++                self.reply_subcommand(subcmd, 0x80, &[0x00]);
++            }
++            SUBCMD_SPI_ERASE => {
++                if args.len() >= 4 {
++                    let addr = u32::from_le_bytes([args[0], args[1], args[2], args[3]]);
++                    let sector = addr & !0xfff;
++                    self.spi_writes.retain(|at, _| at & !0xfff != sector);
++                }
++                self.reply_subcommand(subcmd, 0x80, &[0x00]);
++            }
++            SUBCMD_SET_PLAYER_LIGHTS => {
++                self.player_lights = args.first().copied().unwrap_or(0);
++                self.reply_subcommand(subcmd, 0x80, &[]);
++            }
++            SUBCMD_GET_PLAYER_LIGHTS => {
++                let lights = [self.player_lights];
++                self.reply_subcommand(subcmd, 0xb1, &lights);
++            }
++            SUBCMD_ENABLE_IMU => {
++                self.imu_enabled = args.first().is_some_and(|on| *on != 0);
++                self.reply_subcommand(subcmd, 0x80, &[]);
++            }
++            SUBCMD_GET_REGULATED_VOLTAGE => self.reply_subcommand(subcmd, 0xd0, &[0x83, 0x06]),
++            // Home light, vibration on/off, IMU sensitivity, low power,
++            // NFC/IR MCU: acknowledge and carry on
++            _ => self.reply_subcommand(subcmd, 0x80, &[]),
++        }
++    }
++
++    /// Turn the rumble bytes (2-9: left then right actuator) of an output
++    /// report into a rumble event when they change. Both actuators carry the
++    /// same two bands from SDL and Steam: low band = strong, high = weak.
++    fn handle_rumble(&mut self, data: &[u8]) -> Vec<OutputEvent> {
++        if data.len() < 10 {
++            return vec![];
++        }
++        let (left_high, left_low) = decode_rumble(&data[2..6]);
++        let (right_high, right_low) = decode_rumble(&data[6..10]);
++        let to_magnitude = |index: u16| -> u16 {
++            let permille = rumble_amplitude_permille(index).min(1000.0);
++            (permille / 1000.0 * u16::MAX as f64).round() as u16
++        };
++        let weak = to_magnitude(left_high.max(right_high));
++        let strong = to_magnitude(left_low.max(right_low));
++        if (weak, strong) == self.rumble {
++            return vec![];
++        }
++        self.rumble = (weak, strong);
++        log::trace!("Switch Pro rumble: weak={weak} strong={strong}");
++        vec![OutputEvent::GenericRumble {
++            weak_magnitude: weak,
++            strong_magnitude: strong,
++        }]
++    }
++
++    /// Handle an output report from a host.
++    fn handle_output(&mut self, data: &[u8]) -> Vec<OutputEvent> {
++        let Some(&id) = data.first() else {
++            return vec![];
++        };
++        match id {
++            OUTPUT_USB_CMD => {
++                self.handle_usb_command(data);
++                vec![]
++            }
++            OUTPUT_RUMBLE_AND_SUBCMD => {
++                let events = self.handle_rumble(data);
++                self.handle_subcommand(data);
++                events
++            }
++            OUTPUT_RUMBLE_ONLY => self.handle_rumble(data),
++            _ => {
++                log::debug!("Unhandled Switch Pro output report 0x{id:02x}");
++                vec![]
++            }
++        }
++    }
++
++    /// Update the internal controller state when events are emitted.
++    fn update_state(&mut self, event: NativeEvent) {
++        let value = event.get_value();
++        let capability = event.as_capability();
++        match capability {
++            Capability::Gamepad(gamepad) => match gamepad {
++                Gamepad::Button(btn) => {
++                    let pressed = event.pressed();
++                    match btn {
++                        GamepadButton::South => self.state.a = pressed,
++                        GamepadButton::East => self.state.b = pressed,
++                        GamepadButton::West => self.state.x = pressed,
++                        GamepadButton::North => self.state.y = pressed,
++                        GamepadButton::Start => self.state.plus = pressed,
++                        GamepadButton::Select => self.state.minus = pressed,
++                        GamepadButton::Guide => self.state.home = pressed,
++                        GamepadButton::Screenshot => self.state.capture = pressed,
++                        GamepadButton::DPadUp => self.state.up = pressed,
++                        GamepadButton::DPadDown => self.state.down = pressed,
++                        GamepadButton::DPadLeft => self.state.left = pressed,
++                        GamepadButton::DPadRight => self.state.right = pressed,
++                        GamepadButton::LeftBumper => self.state.l = pressed,
++                        GamepadButton::RightBumper => self.state.r = pressed,
++                        GamepadButton::LeftTrigger => self.state.zl_button = pressed,
++                        GamepadButton::RightTrigger => self.state.zr_button = pressed,
++                        GamepadButton::LeftStick => self.state.l_stick = pressed,
++                        GamepadButton::RightStick => self.state.r_stick = pressed,
++                        _ => (),
++                    }
++                }
++                Gamepad::Axis(axis) => match axis {
++                    GamepadAxis::LeftStick => {
++                        if let InputValue::Vector2 { x, y } = value {
++                            if let Some(x) = x {
++                                self.state.left_stick.0 = stick_value(x);
++                            }
++                            if let Some(y) = y {
++                                // InputPlumber's Y grows downwards, the Pro's upwards
++                                self.state.left_stick.1 = stick_value(-y);
++                            }
++                        }
++                    }
++                    GamepadAxis::RightStick => {
++                        if let InputValue::Vector2 { x, y } = value {
++                            if let Some(x) = x {
++                                self.state.right_stick.0 = stick_value(x);
++                            }
++                            if let Some(y) = y {
++                                self.state.right_stick.1 = stick_value(-y);
++                            }
++                        }
++                    }
++                    GamepadAxis::Hat0 => {
++                        if let InputValue::Vector2 { x, y } = value {
++                            if let Some(x) = x {
++                                self.state.left = x < -0.5;
++                                self.state.right = x > 0.5;
++                            }
++                            if let Some(y) = y {
++                                self.state.up = y < -0.5;
++                                self.state.down = y > 0.5;
++                            }
++                        }
++                    }
++                    _ => (),
++                },
++                Gamepad::Trigger(trigger) => match trigger {
++                    GamepadTrigger::LeftTrigger => {
++                        if let InputValue::Float(v) = value {
++                            self.state.zl_analog = trigger_pressed(self.state.zl_analog, v);
++                        }
++                    }
++                    GamepadTrigger::RightTrigger => {
++                        if let InputValue::Float(v) = value {
++                            self.state.zr_analog = trigger_pressed(self.state.zr_analog, v);
++                        }
++                    }
++                    _ => (),
++                },
++                Gamepad::Accelerometer => {
++                    if let InputValue::Vector3 { x, y, z } = value {
++                        for (i, v) in [x, y, z].into_iter().enumerate() {
++                            if let Some(v) = v {
++                                self.state.accel[i] = clamp_i16(v / 9.80665 * ACCEL_1G);
++                            }
++                        }
++                    }
++                }
++                Gamepad::Gyro => {
++                    if let InputValue::Vector3 { x, y, z } = value {
++                        for (i, v) in [x, y, z].into_iter().enumerate() {
++                            if let Some(v) = v {
++                                self.state.gyro[i] = clamp_i16(v * GYRO_PER_DPS);
++                            }
++                        }
++                    }
++                }
++                _ => (),
++            },
++            _ => (),
++        };
++    }
++}
++
++impl TargetInputDevice for SwitchProDevice {
++    fn write_event(&mut self, event: NativeEvent) -> Result<(), InputError> {
++        log::trace!("Received event: {event:?}");
++
++        // A Pro Controller has no Quick Access button: send Steam's own
++        // chord for it, Guide + A.
++        // TODO: Remove once we implement target device profiles
++        if event.as_capability() == Capability::Gamepad(Gamepad::Button(GamepadButton::QuickAccess))
++        {
++            let pressed = event.pressed();
++            let guide = NativeEvent::new(
++                Capability::Gamepad(Gamepad::Button(GamepadButton::Guide)),
++                event.get_value(),
++            );
++            let south = NativeEvent::new(
++                Capability::Gamepad(Gamepad::Button(GamepadButton::South)),
++                event.get_value(),
++            );
++            let (guide, south) = if pressed {
++                let guide = ScheduledNativeEvent::new(guide, Duration::from_millis(0));
++                let south = ScheduledNativeEvent::new(south, MIN_CHORD_TIME);
++                (guide, south)
++            } else {
++                let guide = ScheduledNativeEvent::new(guide, MIN_CHORD_TIME * 3);
++                let south = ScheduledNativeEvent::new(south, MIN_CHORD_TIME * 2);
++                (guide, south)
++            };
++            self.queued_events.push(guide);
++            self.queued_events.push(south);
++            return Ok(());
++        }
++
++        self.update_state(event);
++        Ok(())
++    }
++
++    fn get_capabilities(&self) -> Result<Vec<Capability>, InputError> {
++        Ok(vec![
++            Capability::Gamepad(Gamepad::Accelerometer),
++            Capability::Gamepad(Gamepad::Axis(GamepadAxis::LeftStick)),
++            Capability::Gamepad(Gamepad::Axis(GamepadAxis::RightStick)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::DPadDown)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::DPadLeft)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::DPadRight)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::DPadUp)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::East)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::Guide)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::LeftBumper)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::LeftStick)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::LeftTrigger)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::North)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::QuickAccess)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::RightBumper)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::RightStick)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::RightTrigger)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::Screenshot)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::Select)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::South)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::Start)),
++            Capability::Gamepad(Gamepad::Button(GamepadButton::West)),
++            Capability::Gamepad(Gamepad::Gyro),
++            Capability::Gamepad(Gamepad::Trigger(GamepadTrigger::LeftTrigger)),
++            Capability::Gamepad(Gamepad::Trigger(GamepadTrigger::RightTrigger)),
++        ])
++    }
++
++    /// Returns any events in the queue up to the [TargetDriver]
++    fn scheduled_events(&mut self) -> Option<Vec<ScheduledNativeEvent>> {
++        if self.queued_events.is_empty() {
++            return None;
++        }
++        let (ready, pending): (Vec<_>, Vec<_>) =
++            self.queued_events.drain(..).partition(|e| e.is_ready());
++        self.queued_events = pending;
++        if ready.is_empty() {
++            return None;
++        }
++        Some(ready)
++    }
++
++    fn stop(&mut self) -> Result<(), InputError> {
++        let _ = self.device.destroy();
++        Ok(())
++    }
++
++    /// Clear any local state on the target device.
++    fn clear_state(&mut self) {
++        self.state = ControllerState::default();
++    }
++}
++
++impl TargetOutputDevice for SwitchProDevice {
++    /// Answer whatever the hosts sent since the last poll, then stream the
++    /// full input report.
++    /// https://www.kernel.org/doc/html/latest/hid/uhid.html#read
++    fn poll(&mut self, _: &Option<CompositeDeviceClient>) -> Result<Vec<OutputEvent>, OutputError> {
++        let mut output_events = vec![];
++        for _ in 0..MAX_EVENTS_PER_POLL {
++            let event = match self.device.read() {
++                Ok(event) => event,
++                Err(StreamError::Io(e)) => {
++                    if e.kind() != ErrorKind::WouldBlock {
++                        log::debug!("Error reading from UHID device: {e:?}");
++                    }
++                    break;
++                }
++                Err(StreamError::UnknownEventType(e)) => {
++                    log::debug!("Unknown event type: {:?}", e);
++                    continue;
++                }
++            };
++
++            match event {
++                uhid_virt::OutputEvent::Start { dev_flags: _ } => {
++                    log::debug!("Start event received");
++                }
++                uhid_virt::OutputEvent::Stop => {
++                    log::debug!("Stop event received");
++                }
++                uhid_virt::OutputEvent::Open => {
++                    log::debug!("Open event received");
++                }
++                uhid_virt::OutputEvent::Close => {
++                    log::debug!("Close event received");
++                }
++                uhid_virt::OutputEvent::Output { data } => {
++                    log::trace!("Got output data: {:02x?}", data);
++                    output_events.extend(self.handle_output(&data));
++                }
++                // Not part of the Pro Controller protocol: answer at once so
++                // a probing host does not wait for the uhid timeout.
++                uhid_virt::OutputEvent::GetReport {
++                    id, report_number, ..
++                } => {
++                    log::debug!("Received GetReport: id: {id}, report_number: {report_number}");
++                    if let Err(e) = self.device.write_get_report_reply(id, 1, vec![]) {
++                        log::warn!("Failed to write get report reply: {:?}", e);
++                    }
++                }
++                uhid_virt::OutputEvent::SetReport {
++                    id, report_number, ..
++                } => {
++                    log::debug!("Received SetReport: id: {id}, report_number: {report_number}");
++                    if let Err(e) = self.device.write_set_report_reply(id, 0) {
++                        log::warn!("Failed to write set report reply: {:?}", e);
++                    }
++                }
++            }
++        }
++
++        // Replies first, in order, then the periodic full report
++        while let Some(reply) = self.replies.pop_front() {
++            self.write_report(&reply);
++        }
++        if self.streaming && self.last_report.elapsed() >= REPORT_INTERVAL {
++            let report = self.full_report();
++            self.write_report(&report);
++            self.last_report = Instant::now();
++        }
++
++        Ok(output_events)
++    }
++
++    fn get_output_capabilities(&self) -> Result<Vec<OutputCapability>, OutputError> {
++        Ok(vec![OutputCapability::ForceFeedback])
++    }
++}
++
++impl Debug for SwitchProDevice {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("SwitchProDevice")
++            .field("state", &self.state)
++            .field("streaming", &self.streaming)
++            .field("imu_enabled", &self.imu_enabled)
++            .finish()
++    }
++}
++
++/// A normalized stick value (-1.0 to 1.0) as a 12-bit Pro Controller axis.
++fn stick_value(value: f64) -> u16 {
++    let value = value.clamp(-1.0, 1.0);
++    (STICK_CENTER as f64 + value * STICK_RANGE as f64)
++        .round()
++        .clamp(0.0, 4095.0) as u16
++}
++
++/// Digital trigger state from an analog value, with hysteresis.
++fn trigger_pressed(was_pressed: bool, value: f64) -> bool {
++    if was_pressed {
++        value >= TRIGGER_RELEASE
++    } else {
++        value >= TRIGGER_PRESS
++    }
++}
++
++fn clamp_i16(value: f64) -> i16 {
++    value.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
++}
++
++/// A stable MAC address for this machine (Steam keeps per-controller
++/// settings by it): Nintendo's OUI plus three bytes of /etc/machine-id.
++fn device_mac() -> [u8; 6] {
++    let id = std::fs::read_to_string("/etc/machine-id").unwrap_or_default();
++    // FNV-1a
++    let mut hash: u32 = 0x811c9dc5;
++    for byte in id.trim().bytes() {
++        hash ^= byte as u32;
++        hash = hash.wrapping_mul(0x01000193);
++    }
++    let h = hash.to_be_bytes();
++    [0x98, 0xb6, 0xe9, h[1], h[2], h[3]]
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn maps_sticks() {
++        assert_eq!(stick_value(0.0), STICK_CENTER);
++        assert_eq!(stick_value(1.0), STICK_CENTER + STICK_RANGE);
++        assert_eq!(stick_value(-1.0), STICK_CENTER - STICK_RANGE);
++        assert_eq!(stick_value(5.0), STICK_CENTER + STICK_RANGE);
++    }
++
++    #[test]
++    fn packs_buttons() {
++        let state = ControllerState {
++            a: true,
++            zr_analog: true,
++            home: true,
++            left: true,
++            ..Default::default()
++        };
++        assert_eq!(state.buttons(), [0x88, 0x10, 0x08]);
++    }
++
++    #[test]
++    fn trigger_hysteresis() {
++        assert!(!trigger_pressed(false, 0.25));
++        assert!(trigger_pressed(false, 0.35));
++        assert!(trigger_pressed(true, 0.25));
++        assert!(!trigger_pressed(true, 0.15));
++    }
++}
+-- 
+2.53.0
+

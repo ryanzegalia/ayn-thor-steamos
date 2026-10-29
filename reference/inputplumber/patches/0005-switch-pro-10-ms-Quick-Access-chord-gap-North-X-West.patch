@@ -1,0 +1,74 @@
+From defd094f5a1cae209a00ba1af4978f99dc3eb07b Mon Sep 17 00:00:00 2001
+From: Ryan Zegalia <ryanzegalia@gmail.com>
+Date: Wed, 14 Oct 2026 16:56:36 -0400
+Subject: [PATCH 5/5] switch-pro: 10 ms Quick Access chord gap; North -> X,
+ West -> Y
+
+InputPlumber's face-button names follow Linux codes (North = BTN_X = X label,
+West = BTN_Y), so the Pro target maps North to the Pro's X and West to its Y
+(was North -> Y). The Home+B Quick Access chord gap drops to 10 ms so Home
+lights at once on Steam's test screen; Steam still opens Quick Access.
+---
+ src/input/target/switch_pro.rs | 25 ++++++++++++++++---------
+ 1 file changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/src/input/target/switch_pro.rs b/src/input/target/switch_pro.rs
+index f29f78a..c539a30 100644
+--- a/src/input/target/switch_pro.rs
++++ b/src/input/target/switch_pro.rs
+@@ -12,11 +12,13 @@
+ //! then adds its own "Nintendo Switch Pro Controller" event devices; InputPlumber
+ //! skips them as virtual, and Steam tells the games it launches to ignore them.
+ //!
+-//! Face buttons map by label: InputPlumber's South/East/West/North are the
+-//! Xbox A/B/X/Y, and a Pro Controller's A/B/X/Y carry the same letters. On a
+-//! handheld whose capability map sends the printed Nintendo letters (the AYN
+-//! Thor's ayn_mcu_nintendo: printed A on the right = South), each printed
+-//! button lands on the Pro Controller button in the same place.
++//! Face buttons map by label. InputPlumber's button names follow the Linux key
++//! codes: South = A, East = B, North = X (BTN_NORTH is BTN_X), West = Y; the
++//! deck target maps them that way too. A Pro Controller's A/B/X/Y carry the
++//! same letters. On a handheld whose capability map sends the printed Nintendo
++//! letters (the AYN Thor's ayn_mcu_nintendo: printed A on the right = South,
++//! printed X on top = North), each printed button lands on the Pro Controller
++//! button in the same place.
+ use std::{
+     collections::{HashMap, VecDeque},
+     str::FromStr,
+@@ -59,6 +61,11 @@ use super::{InputError, OutputError, TargetInputDevice, TargetOutputDevice};
+ /// The minimum interval between button events must wait between
+ /// each other for chords.
+ const MIN_CHORD_TIME: Duration = Duration::from_millis(80);
++/// Gap between the Quick Access chord's presses (and between its releases).
++/// Short, so Steam's input test screen gets the whole chord in one frame
++/// instead of drawing Home first, but more than one report apart so Steam
++/// still sees Home held when the second button arrives.
++const QAM_CHORD_GAP: Duration = Duration::from_millis(10);
+ 
+ /// Full input reports go out at most this often (a wired Pro Controller
+ /// streams every 8 ms; twice that rate keeps input latency down).
+@@ -465,8 +472,8 @@ impl SwitchProDevice {
+                     match btn {
+                         GamepadButton::South => self.state.a = pressed,
+                         GamepadButton::East => self.state.b = pressed,
+-                        GamepadButton::West => self.state.x = pressed,
+-                        GamepadButton::North => self.state.y = pressed,
++                        GamepadButton::North => self.state.x = pressed,
++                        GamepadButton::West => self.state.y = pressed,
+                         GamepadButton::Start => self.state.plus = pressed,
+                         GamepadButton::Select => self.state.minus = pressed,
+                         GamepadButton::Guide => self.state.home = pressed,
+@@ -572,8 +579,8 @@ impl TargetInputDevice for SwitchProDevice {
+             let n = chord.len() as u32;
+             for (i, button) in chord.into_iter().enumerate() {
+                 let i = i as u32;
+-                // Press in order 80 ms apart; release in reverse after the last press
+-                let delay = if pressed { MIN_CHORD_TIME * i } else { MIN_CHORD_TIME * (2 * n - 1 - i) };
++                // Press in order QAM_CHORD_GAP apart; release in reverse after the last press
++                let delay = if pressed { QAM_CHORD_GAP * i } else { QAM_CHORD_GAP * (2 * n - 1 - i) };
+                 let event = NativeEvent::new(
+                     Capability::Gamepad(Gamepad::Button(button)),
+                     event.get_value(),
+-- 
+2.53.0
+

@@ -1,0 +1,53 @@
+#!/bin/bash
+# SteamOS side: put the known-good kernel back on the ABL boot partition.
+#
+#   thor-kernel-rollback --check     read-only: what is in /boot, do the md5s hold
+#   thor-kernel-rollback             KERNEL.known-good -> KERNEL, verified
+#   thor-kernel-rollback --reboot    same, then reboot
+#
+# /boot is sda18 (GPT name ROCKNIX, vfat). ABL loads /boot/KERNEL; the
+# known-good copy (+ .md5) is written by thor-kernel-install before any swap.
+# Modules of the known-good release are never removed, so restoring the one
+# file is the whole rollback. Android twin: thor-kernel-rollback-android.sh.
+set -euo pipefail
+B=/boot
+[[ $EUID == 0 ]] || exec sudo "$0" "$@"
+
+die() { echo "thor-kernel-rollback: $*" >&2; exit 1; }
+md5of() { md5sum "$1" | awk '{print $1}'; }
+want_of() { awk 'NR==1{print $1}' "$1"; }
+
+mountpoint -q "$B" || die "$B is not mounted"
+[[ "$(findmnt -no SOURCE "$B")" == "$(blkid -t PARTLABEL=ROCKNIX -o device | head -1)" ]] || die "$B is not the ROCKNIX partition"
+[[ -f $B/KERNEL.known-good && -f $B/KERNEL.known-good.md5 ]] || die "no $B/KERNEL.known-good (+.md5)"
+good=$(want_of $B/KERNEL.known-good.md5)
+[[ "$(md5of $B/KERNEL.known-good)" == "$good" ]] || die "KERNEL.known-good does not match its md5: not touching anything"
+
+cur=$(md5of $B/KERNEL)
+case "${1:-}" in
+  --check)
+    echo "KERNEL            $cur  ($(stat -c %s $B/KERNEL) B)"
+    echo "KERNEL.known-good $good  ($(stat -c %s $B/KERNEL.known-good) B, md5 ok)"
+    [[ -f $B/KERNEL.md5 ]] && echo "KERNEL.md5 says   $(want_of $B/KERNEL.md5)"
+    [[ "$cur" == "$good" ]] && echo "STATE=known-good" || echo "STATE=other"
+    echo "running: $(uname -r)"
+    exit 0 ;;
+  ""|--reboot) ;;
+  *) die "usage: thor-kernel-rollback [--check|--reboot]" ;;
+esac
+
+if [[ "$cur" == "$good" ]]; then
+  echo "KERNEL is already the known-good one ($good)"
+else
+  cp $B/KERNEL.known-good $B/KERNEL.rollback-tmp
+  sync
+  [[ "$(md5of $B/KERNEL.rollback-tmp)" == "$good" ]] || { rm -f $B/KERNEL.rollback-tmp; die "copy did not verify"; }
+  mv -f $B/KERNEL.rollback-tmp $B/KERNEL
+  echo "$good  KERNEL" >$B/KERNEL.md5
+  sync
+  echo 3 >/proc/sys/vm/drop_caches
+  [[ "$(md5of $B/KERNEL)" == "$good" ]] || die "KERNEL does not read back as $good"
+  echo "restored KERNEL = known-good ($good)"
+fi
+[[ "${1:-}" == --reboot ]] && systemctl reboot
+exit 0

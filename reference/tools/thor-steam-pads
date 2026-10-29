@@ -1,0 +1,17 @@
+#!/bin/bash
+# List the controllers Steam sees (Game Mode), one line each:
+#   type=<eControllerType> style=<eControllerStyle> vidpid=<vid>:<pid> nintendo=<bNintendoLayout> name=<name>
+# Steam's types: 100 SteamOS handheld, 38 Switch Pro, 45 DualSense, 31 Xbox 360.
+# Needs ~/.local/bin/steam-cdp.py and thor-steam-pads.js beside this script.
+here=$(dirname "$(readlink -f "$0")")
+python3 "$here/steam-cdp.py" - < "$here/thor-steam-pads.js" | python3 -c '
+import json, sys
+pads = json.load(sys.stdin)
+if not isinstance(pads, list):
+    sys.exit(f"steam pads: {pads}")
+for p in pads:
+    print("type=%s style=%s vidpid=%04x:%04x nintendo=%s reversed=%s name=%s" % (
+        p.get("eControllerType"), p.get("eControllerStyle"), p.get("unVendorID", 0),
+        p.get("unProductID", 0), p.get("bNintendoLayout"), p.get("bUseReversedLayout"), p.get("strName")))
+print("pads=%d" % len(pads))
+'

@@ -1,0 +1,66 @@
+From 1a5a5fdb15e6b2532109c640eba011c5520c18a0 Mon Sep 17 00:00:00 2001
+From: Ryan Zegalia <ryanzegalia@gmail.com>
+Date: Tue, 13 Oct 2026 23:06:02 -0400
+Subject: [PATCH 2/5] Fix SendEvent panicking the tokio worker; name the ACKed
+ home light and vibration subcommands
+
+CompositeDevice.SendEvent called blocking_write_send_event from its async
+D-Bus handler, which panics inside the tokio runtime and leaves the caller
+hanging. Await the async write_send_event instead.
+---
+ src/dbus/interface/composite_device.rs |  6 +++++-
+ src/input/target/switch_pro.rs         | 13 +++++++++----
+ 2 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/src/dbus/interface/composite_device.rs b/src/dbus/interface/composite_device.rs
+index e3db7ac..cb54ef5 100644
+--- a/src/dbus/interface/composite_device.rs
++++ b/src/dbus/interface/composite_device.rs
+@@ -280,8 +280,12 @@ impl CompositeDeviceInterface {
+ 
+         let event = NativeEvent::new(cap, val);
+ 
++        // The async send: a blocking send from inside this async D-Bus
++        // handler panics the tokio worker ("Cannot block the current thread
++        // from within a runtime") and the caller never gets a reply.
+         self.composite_device
+-            .blocking_write_send_event(event)
++            .write_send_event(event)
++            .await
+             .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+ 
+         Ok(())
+diff --git a/src/input/target/switch_pro.rs b/src/input/target/switch_pro.rs
+index b8f11b3..50f39ce 100644
+--- a/src/input/target/switch_pro.rs
++++ b/src/input/target/switch_pro.rs
+@@ -35,8 +35,9 @@ use crate::{
+         CONTROLLER_TYPE_PRO, GYRO_PER_DPS, INPUT_STANDARD_FULL, INPUT_SUBCMD_REPLY,
+         INPUT_USB_REPLY, OUTPUT_RUMBLE_AND_SUBCMD, OUTPUT_RUMBLE_ONLY, OUTPUT_USB_CMD, PID,
+         REPORT_SIZE, SPI_READ_MAX, STICK_CENTER, STICK_RANGE, SUBCMD_DEVICE_INFO,
+-        SUBCMD_ENABLE_IMU, SUBCMD_GET_PLAYER_LIGHTS, SUBCMD_GET_REGULATED_VOLTAGE,
+-        SUBCMD_SET_INPUT_MODE, SUBCMD_SET_PLAYER_LIGHTS, SUBCMD_SPI_ERASE, SUBCMD_SPI_READ,
++        SUBCMD_ENABLE_IMU, SUBCMD_ENABLE_VIBRATION, SUBCMD_GET_PLAYER_LIGHTS,
++        SUBCMD_GET_REGULATED_VOLTAGE, SUBCMD_SET_HOME_LIGHT, SUBCMD_SET_INPUT_MODE,
++        SUBCMD_SET_PLAYER_LIGHTS, SUBCMD_SPI_ERASE, SUBCMD_SPI_READ,
+         SUBCMD_SPI_WRITE, SUBCMD_TRIGGER_ELAPSED, USB_CMD_ALLOW_TIMEOUT, USB_CMD_BAUDRATE_3M,
+         USB_CMD_HANDSHAKE, USB_CMD_NO_TIMEOUT, USB_CMD_STATUS, VIBRATOR_REPORT, VID,
+     },
+@@ -384,8 +385,12 @@ impl SwitchProDevice {
+                 self.reply_subcommand(subcmd, 0x80, &[]);
+             }
+             SUBCMD_GET_REGULATED_VOLTAGE => self.reply_subcommand(subcmd, 0xd0, &[0x83, 0x06]),
+-            // Home light, vibration on/off, IMU sensitivity, low power,
+-            // NFC/IR MCU: acknowledge and carry on
++            // Nothing to drive on the handheld: acknowledge
++            SUBCMD_SET_HOME_LIGHT | SUBCMD_ENABLE_VIBRATION => {
++                self.reply_subcommand(subcmd, 0x80, &[])
++            }
++            // IMU sensitivity, low power, NFC/IR MCU and anything else:
++            // acknowledge, or the host stalls 500 ms per unanswered request
+             _ => self.reply_subcommand(subcmd, 0x80, &[]),
+         }
+     }
+-- 
+2.53.0
+

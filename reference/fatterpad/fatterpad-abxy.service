@@ -1,0 +1,11 @@
+[Unit]
+Description=FatterPad: per-game face-button layout (letters / positions)
+Documentation=file:///home/steamos/.local/bin/fatterpad-abxy
+
+[Service]
+ExecStart=%h/.local/bin/fatterpad-abxy run
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

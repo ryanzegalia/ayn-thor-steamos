@@ -1,0 +1,54 @@
+From: Ryan Zegalia <ryanzegalia@gmail.com>
+Subject: [PATCH] power: supply: qcom_battmgr: a battery held on the charger is "Not charging"
+
+With charge separation (retroid_charge_now 0, patch 0545) or the firmware
+capacity limit (retroid_limit_capacity 1) holding the battery, the AYN
+Thor's battery firmware reports POWER_SUPPLY_STATUS_DISCHARGING at 0 A
+while the device runs from USB. UPower passes that on as "discharging",
+and Steam takes it as unplugged: its battery idle timer (15 min) put the
+Thor into charge-rest sleep (Wi-Fi off) on the charger, where its
+plugged-in setting (never) should have kept it awake with the panels dark
+(2026-10-20: Steam eACState 1 = BatteryPower while the 80 % hold ran).
+
+Report NOT_CHARGING instead, as Linux does for any battery held at a
+charge limit, only while one of our switches holds it and USB is online
+(read fresh, not the cached value). Unchanged when the switches were never
+written (-1) or charging is on, and on the SC8280XP/X1E80100 variants.
+---
+--- a/drivers/power/supply/qcom_battmgr.c	2026-10-20 09:13:02.439922775 -0400
++++ b/drivers/power/supply/qcom_battmgr.c	2026-10-20 09:13:02.440032906 -0400
+@@ -599,6 +599,9 @@
+ 	return ret;
+ }
+ 
++static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
++					  enum power_supply_property psp);
++
+ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 					 enum power_supply_property psp,
+ 					 union power_supply_propval *val)
+@@ -624,6 +627,24 @@
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+ 		val->intval = battmgr->status.status;
++		/*
++		 * Charge separation (retroid_charge_now 0) or the firmware
++		 * capacity limit (retroid_limit_capacity 1) holds the battery
++		 * while the device runs from USB, and the firmware then reports
++		 * "discharging" at 0 A. Report it the way Linux reports any
++		 * battery held on the charger, so userspace (UPower, Steam's
++		 * plugged-in sleep and charge display) sees the charger. USB
++		 * online is read fresh: a stale value would call a battery that
++		 * is really discharging "not charging".
++		 */
++		if (val->intval == POWER_SUPPLY_STATUS_DISCHARGING &&
++		    battmgr->variant != QCOM_BATTMGR_SC8280XP &&
++		    battmgr->variant != QCOM_BATTMGR_X1E80100 &&
++		    (battmgr->retroid_charge_now == 0 ||
++		     battmgr->retroid_limit_capacity == 1) &&
++		    !qcom_battmgr_usb_sm8350_update(battmgr, POWER_SUPPLY_PROP_ONLINE) &&
++		    battmgr->usb.online)
++			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+ 		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
+ 		val->intval = battmgr->info.charge_type;

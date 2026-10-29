@@ -1,0 +1,960 @@
+#!/usr/bin/env python3
+"""fatterpad-abxy: per-game face-button layout on the Thor's SteamOS (FatterPad's
+ABXY half, Android twin: thor/gyropad, profiles.json abxy).
+
+The Thor's face buttons are printed Nintendo-style (A right, B bottom, X top,
+Y left). InputPlumber's Thor config (capability map ayn_mcu_nintendo) sends
+them to Steam by their printed letters.
+
+My rule (same as FatterPad on Android): games get the buttons by
+POSITION, like an Xbox pad ("positions", the DEFAULT): when a game says A,
+you press the BOTTOM button (printed B); the right one is B. This daemon
+loads an InputPlumber device profile built on the stock Default profile
+(positions swaps South<->East, letters swaps North<->West; see SWAPS), live
+over D-Bus (LoadProfilePath), with no pad reconnect. The Nintendo layout ("letters",
+the printed A on the right is A) is the exception, per game: our emulator
+launchers (thor-launch, thor-browse) keep it, because their emulator configs
+were set up for it (RetroArch: ra_pad.py). Eden Duo maps by position itself,
+so it gets positions and the printed A still lands on Switch A. Steam's own UI
+is the Switch layout too (the hardware IS a Switch-layout
+pad, so in Steam the A on the right is A): "steam_ui": "letters".
+
+Identity: the Thor reaches Steam as the analog handheld ("deck":
+analog triggers, a real Quick Access button) everywhere, Steam's own UI
+included; ThorLook makes Steam show it as the Thor. A game that ships Nintendo
+prompts gets NINTENDO MODE instead: the Switch Pro identity, Steam Input off
+for that game (so Proton hands it the Switch Pro itself, with
+PROTON_ENABLE_HIDRAW from environment.d) and the Nintendo layout; its ZL/ZR are
+on/off, as on a real Switch. Which games: PCGamingWiki's "Nintendo prompts"
+answer for the user's own library (prompts-db keeps that list), and a manual
+choice per game always wins. Steam Input is switched off ahead of launch for
+those games (Steam reads it at launch) and restored when a game leaves the
+mode; the identity switches as soon as Steam starts launching the game.
+
+It follows the game gamescope has in front (GAMESCOPE_FOCUSED_APP on :0):
+every Steam app id, window class and launcher can have its own layout, and
+the choice is remembered. A switch waits until no face button is
+held, so a button held across it never sticks.
+
+Config (~/.config/fatterpad/abxy.json, re-read when it changes):
+  {"default": "positions",
+   "steam_ui": "letters",                    # Steam's own UI; "default" follows default
+   "launchers": {"thor-launch": "letters"},  # substring of the launch command
+   "classes": {"<wm_class>": "letters"},     # e.g. an emulator
+   "apps": {"<steam appid>": {"mode": "letters", "nintendo": true, "name": "..."}}}
+Precedence: app, Nintendo mode, class, launcher, default.
+
+Usage:
+  fatterpad-abxy run                  the daemon (systemd --user unit)
+  fatterpad-abxy status               what is in front and which layout it has
+  fatterpad-abxy flip                 switch the game in front and remember it
+  fatterpad-abxy default letters|positions         the default for games
+  fatterpad-abxy set letters|positions [--class]   same, explicit; --class
+                                      saves it for the window class (every
+                                      game of that emulator) instead
+  fatterpad-abxy forget [--class]     drop the saved choice for the game in front
+  fatterpad-abxy identity switch-pro|deck [--app N]   what the Thor reaches
+                                      Steam as for that game (deck = analog
+                                      triggers); with no game, or --default,
+                                      the default (deck)
+  fatterpad-abxy identity forget [--app N]
+  fatterpad-abxy nintendo on|off|forget [--app N]   Nintendo mode for that game
+                                      (forget = follow PCGamingWiki again);
+                                      takes effect at its next launch
+  fatterpad-abxy classify [--app N]   how Steam's data sorts a game (auto rules)
+  fatterpad-abxy classify --selftest  the auto rules on known games
+  --app <steam appid>                 act on that game instead of the one in
+                                      front (the Decky panel passes Steam's
+                                      running app); with Steam's UI in front
+                                      the default is the last game that was
+"""
+from __future__ import annotations
+
+import fcntl
+import glob
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+import dbus
+import yaml
+
+HOME = os.path.expanduser("~")
+CONF = f"{HOME}/.config/fatterpad/abxy.json"
+STATE_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}") + "/fatterpad"
+STATE = f"{STATE_DIR}/abxy.json"
+PROF_DIR = f"{HOME}/.local/share/fatterpad/profiles"
+STOCK = "/usr/share/inputplumber/profiles/default.yaml"
+PROFILES = {"letters": (f"{PROF_DIR}/letters.yaml", "FatterPad letters"),
+            "positions": (f"{PROF_DIR}/positions.yaml", "FatterPad positions")}
+PROMPTS_DB = f"{HOME}/.local/share/fatterpad/prompts.json"  # written by prompts-db
+STEAM_INPUT_OFF, STEAM_INPUT_DEFAULT = 0, 1  # Steam's per-game "Steam Input" setting
+SYNC_S = 60.0   # retry the Steam Input sync this often while Steam cannot be asked
+HOLD_S = 8.0    # keep a game's own identity this long after Steam's UI comes back in front
+DISPLAY = os.environ.get("FATTERPAD_DISPLAY", ":0")
+STEAM_UI = {0, 769}
+PAD_NAME = "AYN Thor"
+IP_BUS = "org.shadowblip.InputPlumber"
+IP_ROOT = "/org/shadowblip/InputPlumber"
+IP_IFACE = "org.shadowblip.Input.CompositeDevice"
+IP_MANAGER = f"{IP_ROOT}/Manager"
+IP_MANAGER_IFACE = "org.shadowblip.InputManager"
+PROPS = "org.freedesktop.DBus.Properties"
+# What the Thor reaches Steam as (the InputPlumber target): "deck" (the stock
+# SteamOS-handheld identity, the DEFAULT: analog triggers, a real Quick Access
+# button) or "switch-pro" (our InputPlumber fork, reference/inputplumber/patches:
+# a real Switch Pro protocol, ZL/ZR on/off; used for Nintendo mode). The
+# kernel's HID ids tell which one is live; a stock InputPlumber (no
+# switch-pro target) stays deck.
+IDENTITIES = {"switch-pro": "switch-pro", "deck": "deck-uhid"}
+IDENTITY_HID = {"switch-pro": ("057E:2009",), "deck": ("28DE:12F0", "28DE:12F1", "28DE:1205")}
+FACE = ("South", "East", "North", "West")
+# The Thor's base map (ayn_mcu_nintendo) sends every face button by its
+# printed LETTER, in InputPlumber's names, which follow Linux key codes:
+# South = A, East = B, North = X (BTN_NORTH is BTN_X), West = Y. Steam's
+# handheld drawing proves it (10-14 10:30: North lights the Deck's X, left).
+# So letters is the stock Default profile and positions swaps both pairs.
+# (10-14 08:28 this was briefly letters = North<->West: the top button lit Y
+# on the Switch Pro test screen, but that was our switch-pro target mapping
+# North to the Pro's Y, fixed in the fork instead.)
+SWAPS = {"letters": {},
+         "positions": {"South": "East", "East": "South", "North": "West", "West": "North"}}
+MODES = ("letters", "positions")
+# Launch-command substrings (longest match wins). Our emulator launchers keep
+# the Nintendo layout, because those emulator configs expect the printed
+# letters (RetroArch: ra_pad.py). PlayStation systems are the exception:
+# Cross is the bottom button, so PSP and PS2 get positions
+# (from my controller test matrix). Eden Duo too: its
+# auto pad mapping is Eden's stock one, BY POSITION (Switch A = the pad's
+# east button), so letters reached it double-swapped (seen 10-13,
+# A/B backwards in Mario Kart 8); positions put Switch A on the printed A.
+LAUNCHERS = {
+    "thor-launch": "letters", "thor-browse": "letters",
+    "edenduo": "positions", "eden-duo": "positions", "eden-cli": "positions",
+    "thor-launch switch/": "positions", "thor-browse switch/": "positions",
+    "thor-launch psp/": "positions", "thor-browse psp/": "positions",
+    "thor-launch ps2/": "positions", "thor-browse ps2/": "positions",
+}
+# Window classes (beat launchers): Eden Duo started from the ROM browser,
+# whose command names no system.
+CLASSES = {"eden-cli": "positions"}
+# Steam's own data for a game (the store categories and tags Steam's UI
+# holds) sorts it the first time it is in front, below any manual choice:
+#   tag 699 "Racing": analog triggers matter -> the handheld identity (deck)
+#   NOT category 59 "Steam Input API": tested 10-14, Castle Crashers (59) still
+#     draws its own Xbox prompts and Steam maps the Pro's buttons by label, so
+#     the Nintendo layout put Select on the right button under an Xbox "A";
+#     the Xbox layout is right for it like for every game with Xbox prompts
+#   anything else -> the default: Xbox layout on the analog handheld identity.
+#   Nintendo prompts are NOT Steam data: PCGamingWiki via prompts-db (Nintendo
+#   mode), checked at decision time, not stored here.
+CAT_STEAM_INPUT_API = 59
+TAG_RACING = 699
+STEAM_CDP = f"{HOME}/.local/bin/steam-cdp.py"
+SELFTEST = {
+    2379780: ("positions", "deck"),   # Balatro: Xbox prompts only
+    1145360: ("positions", "deck"),   # Hades: Steam data alone; its Nintendo mode comes from PCGamingWiki
+    4078430: ("positions", "deck"),   # STAR WARS Galactic Racer: racing
+    204360: ("positions", "deck"),    # Castle Crashers: Steam Input API, but Xbox prompts
+}
+CHECK_S = 5.0
+FACE_CODES = (0x130, 0x131, 0x133, 0x134)  # BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST
+EVIOCGKEY = (2 << 30) | (96 << 16) | (ord("E") << 8) | 0x18  # _IOC(READ, 'E', 0x18, 96)
+
+
+def log(msg: str) -> None:
+    print(f"fatterpad-abxy: {msg}", flush=True)
+
+
+# ------------------------------------------------------------------ config --
+def load_conf() -> dict:
+    try:
+        with open(CONF, encoding="utf-8") as fh:
+            c = json.load(fh)
+    except (OSError, ValueError):
+        c = {}
+    c.setdefault("default", "positions")
+    if c.get("schema", 1) < 2:
+        # 10-14: the default identity became the analog handheld; the old
+        # auto sort stored switch-pro for every game it saw
+        c["identity"] = "deck"
+        for au in (c.get("auto") or {}).values():
+            if isinstance(au, dict) and au.get("identity") == "switch-pro":
+                au["identity"] = "deck"
+        c["schema"] = 2
+        c["migrated"] = True
+    c.setdefault("identity", "deck")
+    c.setdefault("auto", {})
+    c.setdefault("steam_input_off", [])
+    c.setdefault("steam_ui", "letters")
+    c.setdefault("launchers", dict(LAUNCHERS))
+    c.setdefault("classes", dict(CLASSES))
+    c.setdefault("apps", {})
+    return c
+
+
+def save_conf(c: dict) -> None:
+    c.pop("migrated", None)
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    tmp = f"{CONF}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(c, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, CONF)
+
+
+def decide(c: dict, app: int, wclass: str, cmd: str = "") -> tuple[str, str]:
+    """(mode, why) for an app: app, class, launcher, default."""
+    default = c["default"] if c["default"] in MODES else "positions"
+    if app in STEAM_UI:
+        ui = c.get("steam_ui")
+        return (ui, "Steam UI") if ui in MODES else (default, "Steam UI (default)")
+    a = c["apps"].get(str(app))
+    if isinstance(a, dict) and a.get("mode") in MODES:
+        return a["mode"], f"app {app}"
+    on, nwhy = nintendo_for(c, app)
+    if on:
+        return "letters", f"Nintendo mode ({nwhy})"
+    if wclass and c["classes"].get(wclass) in MODES:
+        return c["classes"][wclass], f"class {wclass}"
+    low = cmd.lower()
+    rules = sorted((c.get("launchers") or {}).items(), key=lambda kv: -len(kv[0]))
+    for key, mode in rules:  # the most specific (longest) match wins
+        if key and mode in MODES and key.lower() in low:
+            return mode, f"launcher {key}"
+    au = (c.get("auto") or {}).get(str(app))
+    if isinstance(au, dict) and au.get("mode") in MODES:
+        return au["mode"], f"auto: {au.get('why') or 'default'}"
+    return default, "default"
+
+
+def decide_identity(c: dict, f: dict) -> tuple[str, str]:
+    """(identity, why) for what is in front: the game's own choice, Nintendo
+    mode, else the default. With Steam's UI over a game, the game keeps its
+    identity (a switch reconnects the pad, and Quick Access must not do
+    that); while Steam is still launching a game, that game decides, so the
+    identity is in place before the game looks for controllers."""
+    default = c.get("identity") if c.get("identity") in IDENTITIES else "deck"
+    app = f.get("app") or 0
+    if app in STEAM_UI:
+        app = (f.get("behind") or {}).get("app") or f.get("launching") or 0
+    a = c["apps"].get(str(app)) if app else None
+    if isinstance(a, dict) and a.get("identity") in IDENTITIES:
+        return a["identity"], f"app {app}"
+    on, nwhy = nintendo_for(c, app) if app else (False, "")
+    if on:
+        return "switch-pro", f"Nintendo mode ({nwhy})"
+    au = (c.get("auto") or {}).get(str(app)) if app else None
+    if isinstance(au, dict) and au.get("identity") in IDENTITIES:
+        return au["identity"], f"auto: {au.get('why') or 'default'}"
+    return default, "default"
+
+
+# ----------------------------------------------------------- Nintendo mode --
+_prompts = {"mtime": None, "games": {}}
+
+
+def prompts() -> dict:
+    """prompts-db's list (appid -> PCGamingWiki answers), re-read when it changes."""
+    try:
+        m = os.stat(PROMPTS_DB).st_mtime
+    except OSError:
+        return {}
+    if m != _prompts["mtime"]:
+        try:
+            with open(PROMPTS_DB, encoding="utf-8") as fh:
+                _prompts["games"] = json.load(fh).get("games") or {}
+        except (OSError, ValueError):
+            _prompts["games"] = {}
+        _prompts["mtime"] = m
+    return _prompts["games"]
+
+
+def nintendo_for(c: dict, app: int) -> tuple[bool, str]:
+    """(on, why): the game's own choice, else PCGamingWiki says it ships
+    Nintendo prompts. Never for Steam's UI or a non-Steam shortcut."""
+    if not app or app in STEAM_UI or app >= 0x80000000:
+        return False, ""
+    a = c["apps"].get(str(app))
+    if isinstance(a, dict) and isinstance(a.get("nintendo"), bool):
+        return a["nintendo"], "this game"
+    g = prompts().get(str(app)) or {}
+    if str(g.get("nintendo_prompts") or "").strip().lower() == "true":
+        return True, "PCGamingWiki"
+    return False, ""
+
+
+def nintendo_apps(c: dict) -> set[int]:
+    """Every game in Nintendo mode: wiki yes or set by hand, minus hand offs."""
+    apps = {int(a) for a in prompts() if a.isdigit()} | {int(a) for a in c["apps"] if a.isdigit()}
+    return {a for a in apps if nintendo_for(c, a)[0]}
+
+
+def sync_steam_input(c: dict) -> bool:
+    """Steam Input OFF for every Nintendo-mode game (so Proton hands it the
+    Switch Pro itself), back to Steam's default for a game that left the
+    mode. Only games this daemon switched are ever restored. False when
+    Steam could not be asked (try again later)."""
+    want = nintendo_apps(c)
+    done = {int(a) for a in c.get("steam_input_off") or []}
+    if want == done:
+        return True
+    calls = [f"SteamClient.Apps.SetThirdPartyControllerConfiguration({a}, {STEAM_INPUT_OFF})" for a in sorted(want)]
+    calls += [f"SteamClient.Apps.SetThirdPartyControllerConfiguration({a}, {STEAM_INPUT_DEFAULT})"
+              for a in sorted(done - want)]
+    try:
+        out = subprocess.run(["python3", STEAM_CDP, f"({', '.join(calls)}, true)"],
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    if out != "true":
+        return False
+    log(f"Steam Input off for {sorted(want)}; back to default for {sorted(done - want)}")
+    c["steam_input_off"] = sorted(want)
+    save_conf(c)
+    return True
+
+
+_launch_pids: dict[int, int] = {}   # pid -> its SteamLaunch app id (0 = not a launch)
+_young: dict[int, float] = {}        # pid -> first seen; read again while young (fork before exec)
+
+
+def steam_launching() -> int:
+    """The game Steam is launching or running (the newest reaper
+    'SteamLaunch AppId=N'), 0 for none. Runs every second, so each process's
+    command line is read only once (measured 10-14: reading them all each
+    time cost the daemon 3% of a core)."""
+    best = (0, 0)
+    alive = set()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        alive.add(pid)
+        app = _launch_pids.get(pid)
+        if app == 0 and time.monotonic() - _young.get(pid, 0.0) < 5:
+            app = None      # seen right after fork: its command line may not be the reaper's yet
+        if app is None:
+            _young.setdefault(pid, time.monotonic())
+            app = 0
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    argv = fh.read().split(b"\0")
+            except OSError:
+                argv = []
+            if len(argv) > 2 and argv[0].endswith(b"reaper") and b"SteamLaunch" in argv:
+                for a in argv:
+                    if a.startswith(b"AppId="):
+                        try:
+                            app = int(a[6:])
+                        except ValueError:
+                            pass
+            _launch_pids[pid] = app
+        if app:
+            best = max(best, (pid, app))
+    for pid in set(_launch_pids) - alive:
+        del _launch_pids[pid]
+        _young.pop(pid, None)
+    return best[1]
+
+
+def steam_app_data(app: int) -> dict | None:
+    """A game's name, store categories and tags, from Steam's UI (CDP)."""
+    expr = (f"(() => {{ const o = appStore.GetAppOverviewByAppID({int(app)}); return o ? "
+            "{name: o.display_name, cats: Array.from(o.m_setStoreCategories || []), "
+            "tags: Array.from(o.m_setStoreTags || [])} : null; })()")
+    try:
+        out = subprocess.run(["python3", STEAM_CDP, expr], capture_output=True,
+                             text=True, timeout=10).stdout
+        return json.loads(out) if out.strip() else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def classify(app: int) -> dict | None:
+    """Sort a Steam game from Steam's own data (see CAT_STEAM_INPUT_API).
+    None for Steam's UI, a non-Steam shortcut (launchers decide those) or
+    when Steam cannot be asked."""
+    if not app or app in STEAM_UI or app >= 0x80000000:
+        return None
+    d = steam_app_data(app)
+    if not d:
+        return None
+    cats, tags = set(d.get("cats") or []), set(d.get("tags") or [])
+    r = {"name": d.get("name") or "", "mode": "positions", "identity": "deck", "why": "default"}
+    why = []
+    if CAT_STEAM_INPUT_API in cats:
+        why.append("Steam Input API, own prompts")
+    if TAG_RACING in tags:
+        r["identity"] = "deck"
+        why.append("racing")
+    if why:
+        r["why"] = ", ".join(why)
+    return r
+
+
+# ---------------------------------------------------------------- profiles --
+def build_profiles() -> None:
+    """Stock Default profile plus each layout's face-button swaps."""
+    for mode, (path, name) in PROFILES.items():
+        with open(STOCK, encoding="utf-8") as fh:
+            prof = yaml.safe_load(fh)
+        mapping = [m for m in prof.get("mapping") or []
+                   if ((m.get("source_event") or {}).get("gamepad") or {}).get("button") not in FACE]
+        for btn in FACE:
+            dst = SWAPS[mode].get(btn, btn)
+            mapping.append({"name": f"FatterPad {btn} to {dst}",
+                            "source_event": {"gamepad": {"button": btn}},
+                            "target_events": [{"gamepad": {"button": dst}}]})
+        prof["name"] = name
+        prof["mapping"] = mapping
+        os.makedirs(PROF_DIR, exist_ok=True)
+        body = (f"# Written by fatterpad-abxy from {STOCK}: face buttons, {mode}.\n"
+                + yaml.safe_dump(prof, sort_keys=False))
+        try:
+            with open(path, encoding="utf-8") as fh:
+                if fh.read() == body:
+                    continue
+        except OSError:
+            pass
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.replace(path + ".tmp", path)
+        log(f"wrote {path}")
+
+
+def profile_for(mode: str) -> tuple[str, str]:
+    """(path, expected ProfileName)."""
+    return PROFILES["positions" if mode == "positions" else "letters"]
+
+
+# ------------------------------------------------------------ inputplumber --
+def composites(bus) -> list:
+    """The Thor pad's CompositeDevice objects."""
+    out = []
+    try:
+        xml = dbus.Interface(bus.get_object(IP_BUS, IP_ROOT),
+                             "org.freedesktop.DBus.Introspectable").Introspect()
+    except dbus.DBusException:
+        return out
+    for node in ET.fromstring(str(xml)).findall("node"):
+        name = node.get("name", "")
+        if not name.startswith("CompositeDevice"):
+            continue
+        obj = bus.get_object(IP_BUS, f"{IP_ROOT}/{name}")
+        try:
+            if str(obj.Get(IP_IFACE, "Name", dbus_interface="org.freedesktop.DBus.Properties")) == PAD_NAME:
+                out.append(obj)
+        except dbus.DBusException:
+            continue
+    return out
+
+
+def profile_name(obj) -> str:
+    return str(obj.Get(IP_IFACE, "ProfileName", dbus_interface="org.freedesktop.DBus.Properties"))
+
+
+def pad_node() -> str | None:
+    """The Thor's own pad (rsinput) evdev node, for its key state."""
+    try:
+        with open("/proc/bus/input/devices", encoding="utf-8", errors="replace") as fh:
+            blocks = fh.read().split("\n\n")
+    except OSError:
+        return None
+    for b in blocks:
+        if "rsinput-gamepad" in b:
+            for line in b.splitlines():
+                if line.startswith("H: Handlers="):
+                    for h in line.split("=", 1)[1].split():
+                        if h.startswith("event"):
+                            return f"/dev/input/{h}"
+    return None
+
+
+def face_held() -> bool:
+    """A face button is down right now (EVIOCGKEY: the kernel's key state,
+    readable while InputPlumber holds its grab). Switching profiles then
+    would send its release to the other button and leave one stuck.
+    (InputPlumber 0.81's SendEvent panics a worker thread, so no blind
+    releases like FatterPad does on Android.)"""
+    node = pad_node()
+    if not node:
+        return False
+    buf = bytearray(96)  # KEY_MAX 0x2ff -> 96 bytes
+    try:
+        fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        fcntl.ioctl(fd, EVIOCGKEY, buf)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return any(buf[c // 8] >> (c % 8) & 1 for c in FACE_CODES)
+
+
+def apply_mode(bus, mode: str) -> bool:
+    path, want = profile_for(mode)
+    pads = composites(bus)
+    if not pads:
+        return False
+    if any(profile_name(o) != want for o in pads):
+        deadline = time.monotonic() + 5
+        while face_held() and time.monotonic() < deadline:
+            time.sleep(0.05)
+    for obj in pads:
+        if profile_name(obj) != want:
+            dbus.Interface(obj, IP_IFACE).LoadProfilePath(path)
+    return True
+
+
+def drifted(bus, mode: str) -> bool:
+    _, want = profile_for(mode)
+    return any(profile_name(o) != want for o in composites(bus))
+
+
+def live_identity() -> str | None:
+    """The identity the pad has right now, from the kernel's HID devices."""
+    ids = set()
+    for path in glob.glob("/sys/bus/hid/devices/*"):
+        parts = os.path.basename(path).split(".")[0].split(":", 1)
+        if len(parts) == 2:
+            ids.add(parts[1].upper())
+    for ident, hid in IDENTITY_HID.items():
+        if ids.intersection(hid):
+            return ident
+    return None
+
+
+def supported_targets(bus) -> set:
+    try:
+        obj = bus.get_object(IP_BUS, IP_MANAGER)
+        return {str(t) for t in obj.Get(IP_MANAGER_IFACE, "SupportedTargetDeviceIds", dbus_interface=PROPS)}
+    except dbus.DBusException:
+        return set()
+
+
+def apply_identity(bus, ident: str) -> str:
+    """Give the pad an identity: "ok" (live), "unsupported" (this InputPlumber
+    has no such target, e.g. the stock binary), or "nopad"."""
+    if live_identity() == ident:
+        return "ok"
+    target = IDENTITIES[ident]
+    if target not in supported_targets(bus):
+        return "unsupported"
+    pads = composites(bus)
+    if not pads:
+        return "nopad"
+    deadline = time.monotonic() + 5
+    while face_held() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    for obj in pads:
+        dbus.Interface(obj, IP_IFACE).SetTargetDevices([target, "keyboard"])
+    return "ok"
+
+
+# ------------------------------------------------------------------- focus --
+def xprop(*args: str) -> str:
+    try:
+        return subprocess.run(["xprop", "-display", DISPLAY, *args], capture_output=True,
+                              text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def cardinal(text: str, atom: str) -> int:
+    for line in text.splitlines():
+        if line.startswith(atom + "(") and "=" in line:
+            try:
+                return int(line.split("=", 1)[1].split(",")[0].strip())
+            except ValueError:
+                return 0
+    return 0
+
+
+def window_info(win: int) -> tuple[str, str]:
+    """(wm_class, title) of a window, lower-case class."""
+    if not win:
+        return "", ""
+    out = xprop("-id", str(win), "WM_CLASS", "WM_NAME")
+    wclass = title = ""
+    for line in out.splitlines():
+        if line.startswith("WM_CLASS") and "=" in line:
+            parts = [p.strip().strip('"') for p in line.split("=", 1)[1].split(",")]
+            wclass = (parts[-1] if parts else "").lower()
+        elif line.startswith("WM_NAME") and "=" in line:
+            title = line.split("=", 1)[1].strip().strip('"')
+    return wclass, title
+
+
+def cardinals(text: str, atom: str) -> list[int]:
+    for line in text.splitlines():
+        if line.startswith(atom + "(") and "=" in line:
+            try:
+                return [int(v) for v in line.split("=", 1)[1].split(",") if v.strip()]
+            except ValueError:
+                return []
+    return []
+
+
+def launch_cmd(app: int) -> str:
+    """What Steam ran for this app id: the reaper's command after '--'."""
+    if not app or app in STEAM_UI:
+        return ""
+    want = f"AppId={app}".encode()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except OSError:
+            continue
+        if len(argv) > 2 and argv[0].endswith(b"reaper") and b"SteamLaunch" in argv and want in argv:
+            if b"--" in argv:
+                argv = argv[argv.index(b"--") + 1:]
+            return " ".join(a.decode(errors="replace") for a in argv if a)
+    return ""
+
+
+def focus_now() -> dict:
+    """The app in front, plus the game behind Steam's UI when Steam is in
+    front (GAMESCOPE_FOCUSABLE_WINDOWS lists window, app, pid triples)."""
+    root = xprop("-root", "GAMESCOPE_FOCUSED_APP", "GAMESCOPE_FOCUSED_WINDOW",
+                 "GAMESCOPE_FOCUSABLE_WINDOWS")
+    app = cardinal(root, "GAMESCOPE_FOCUSED_APP")
+    win = cardinal(root, "GAMESCOPE_FOCUSED_WINDOW")
+    f = {"app": app, "window": win, "class": "", "title": "", "cmd": "", "behind": None,
+         "launching": steam_launching()}
+    if app not in STEAM_UI:
+        f["class"], f["title"] = window_info(win)
+        f["cmd"] = launch_cmd(app)
+        return f
+    trip = cardinals(root, "GAMESCOPE_FOCUSABLE_WINDOWS")
+    for i in range(0, len(trip) - 2, 3):
+        w, a = trip[i], trip[i + 1]
+        if a and a not in STEAM_UI:
+            c, t = window_info(w)
+            f["behind"] = {"app": a, "class": c, "title": t, "cmd": launch_cmd(a)}
+            break
+    return f
+
+
+def write_state(st: dict) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STATE + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+    os.replace(STATE + ".tmp", STATE)
+
+
+def read_state() -> dict:
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+# ------------------------------------------------------------------ daemon --
+def run() -> int:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    build_profiles()
+    bus = dbus.SystemBus()
+    conf_mtime = None
+    conf = load_conf()
+    if conf.get("migrated"):
+        save_conf(conf)
+        log("config moved to the analog handheld default (schema 2)")
+    cur = {"app": -1, "class": "", "title": "", "mode": None, "why": ""}
+    ident_want = None
+    ident_note = ""
+    last_game = read_state().get("last_game") or {}
+    spy = None
+    last_check = 0.0
+    launching = 0
+    synced, last_sync, prompts_mtime = False, 0.0, None
+    asked_db = set()    # games launched before prompts-db knew them: update asked once
+    ident_since = 0.0   # when the identity last changed
+    changed_later = False
+    spy_buf, spy_seen = b"", {}   # partial line; atom -> last value xprop printed
+    last_tick = 0.0
+    while True:
+        if spy is None or spy.poll() is not None:
+            spy = subprocess.Popen(["xprop", "-display", DISPLAY, "-root", "-spy",
+                                    "GAMESCOPE_FOCUSED_APP", "GAMESCOPE_FOCUSED_WINDOW"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            spy_buf, spy_seen = b"", {}
+            changed = True
+        else:
+            changed = False
+        ready, _, _ = select.select([spy.stdout], [], [], 1.0)
+        if ready:
+            try:
+                data = os.read(spy.stdout.fileno(), 65536)
+            except OSError:
+                data = b""
+            if not data:            # xprop exited (gamescope or Xwayland went away)
+                spy.wait()
+                spy = None
+                time.sleep(2)
+                continue
+            # While a game runs gamescope sets both atoms again ~75 times a
+            # second with the same values (measured 10-14: 1129 each in 15 s,
+            # which made this daemon use a third of a core). Only a new value
+            # is a change.
+            lines = (spy_buf + data).split(b"\n")
+            spy_buf = lines.pop()
+            for line in lines:
+                atom, _, value = line.partition(b" = ")
+                if value and spy_seen.get(atom) != value:
+                    spy_seen[atom] = value
+                    changed = True
+        now = time.monotonic()
+        if not changed and now - last_tick < 1.0:
+            continue                # the repeats: the once-a-second checks below can wait
+        last_tick = now
+        try:
+            m = os.stat(CONF).st_mtime
+        except OSError:
+            m = None
+        if m != conf_mtime:
+            conf_mtime, conf = m, load_conf()
+            changed, synced, last_sync = True, False, 0.0
+        try:
+            pm = os.stat(PROMPTS_DB).st_mtime
+        except OSError:
+            pm = None
+        if pm != prompts_mtime:
+            prompts_mtime, changed, synced, last_sync = pm, True, False, 0.0
+        now = time.monotonic()
+        if not synced and now - last_sync >= (0 if last_sync == 0.0 else SYNC_S):
+            last_sync = now
+            synced = sync_steam_input(conf)
+            try:
+                conf_mtime = os.stat(CONF).st_mtime   # our own save is not a change
+            except OSError:
+                pass
+        la = steam_launching()
+        if la != launching:
+            launching, changed = la, True
+            if la and la < 0x80000000 and str(la) not in prompts() and la not in asked_db:
+                asked_db.add(la)    # a game the list does not know yet (new purchase)
+                subprocess.run(["systemctl", "--user", "start", "--no-block", "prompts-db.service"],
+                               capture_output=True, timeout=10)
+        if cur["mode"] is None and now - last_check >= CHECK_S:
+            changed = True          # no pad or no D-Bus last time: try again
+        if changed_later and now - ident_since >= HOLD_S:
+            changed, changed_later = True, False
+        try:
+            if changed:
+                f = focus_now()
+                if f["app"] not in STEAM_UI:
+                    last_game = {k: f[k] for k in ("app", "class", "title", "cmd")}
+                elif f["behind"]:
+                    last_game = f["behind"]
+                app_key = str(f["app"])
+                if f["app"] not in STEAM_UI and 0 < f["app"] < 0x80000000 and app_key not in conf["auto"]:
+                    r = classify(f["app"])
+                    if r:
+                        conf["auto"][app_key] = r
+                        save_conf(conf)
+                        log(f"auto: {f['app']} {r['name']!r}: {r['mode']}, {r['identity']} ({r['why']})")
+                want, iwhy = decide_identity(conf, f)
+                # Steam launches a game in steps (a reaper for its setup, then
+                # one for the game), with Steam's UI in front in between: keep
+                # a game's identity for HOLD_S after its reason goes, or the pad
+                # reconnects twice while the game looks for it (10-14, Hades)
+                if want != conf.get("identity"):
+                    ident_since = now
+                elif (ident_want and ident_want != want and f["app"] in STEAM_UI
+                        and now - ident_since < HOLD_S):
+                    want, iwhy = ident_want, "holding while Steam launches the game"
+                    changed_later = True
+                ident_want = want
+                res = apply_identity(bus, ident_want)
+                note = f"{ident_want}:{res}"
+                if note != ident_note:
+                    log(f"identity {ident_want} ({iwhy}): {res}")
+                    ident_note = note
+                mode, why = decide(conf, f["app"], f["class"], f["cmd"])
+                if mode != cur["mode"] or f["app"] != cur["app"]:
+                    if apply_mode(bus, mode):
+                        if mode != cur["mode"]:
+                            log(f"{mode} ({why}): app {f['app']} {f['class']} {f['title']!r}")
+                        cur = {**f, "mode": mode, "why": why}
+                        write_state({**cur, "last_game": last_game})
+                    else:
+                        cur["mode"] = None   # no pad yet: try again
+            if now - last_check >= CHECK_S:
+                last_check = now
+                if ident_want and live_identity() not in (ident_want, None):
+                    if apply_identity(bus, ident_want) == "ok":
+                        log(f"identity drifted (InputPlumber restarted?): {ident_want} again")
+                if cur["mode"] and drifted(bus, cur["mode"]):
+                    log(f"profile drifted (InputPlumber restarted?): {cur['mode']} again")
+                    apply_mode(bus, cur["mode"])
+        except dbus.DBusException as e:
+            log(f"InputPlumber: {e.get_dbus_message()}")
+            cur["mode"] = None
+            bus = dbus.SystemBus()
+            time.sleep(2)
+
+
+# --------------------------------------------------------------------- cli --
+def target(argv: list[str], st: dict, f: dict) -> dict | None:
+    """The game a command acts on: --app N (the Decky panel passes Steam's
+    running app), else the game in front, else the last game that was in
+    front (Steam's UI or Quick Access is up over it)."""
+    last = st.get("last_game") or {}
+    if "--app" in argv:
+        try:
+            app = int(argv[argv.index("--app") + 1])
+        except (IndexError, ValueError):
+            return None
+        if f["app"] == app:
+            return {k: f[k] for k in ("app", "class", "title", "cmd")}
+        if f["behind"] and f["behind"]["app"] == app:
+            return dict(f["behind"])
+        if last.get("app") == app:
+            return dict(last)
+        return {"app": app, "class": "", "title": "", "cmd": launch_cmd(app)}
+    if f["app"] and f["app"] not in STEAM_UI:
+        return {k: f[k] for k in ("app", "class", "title", "cmd")}
+    if f["behind"]:
+        return dict(f["behind"])
+    return dict(last) if last.get("app") else None
+
+
+def cli(argv: list[str]) -> int:
+    cmd = argv[0] if argv else "status"
+    if cmd == "run":
+        return run()
+    st = read_state()
+    f = focus_now()
+    conf = load_conf()
+    g = target(argv, st, f)
+    if cmd == "status":
+        out = {"front": f, "daemon_applied": st.get("mode"), "game": g}
+        out["layout"], out["because"] = decide(conf, f["app"], f["class"], f["cmd"])
+        out["default"] = conf["default"]
+        out["identity"], out["identity_because"] = decide_identity(conf, f)
+        out["identity_live"] = live_identity()
+        if g:
+            out["game_layout"], out["game_because"] = decide(conf, g["app"], g["class"], g.get("cmd", ""))
+            out["game_identity"], out["game_identity_because"] = decide_identity(conf, {"app": g["app"]})
+            out["game_nintendo"], out["game_nintendo_because"] = nintendo_for(conf, g["app"])
+        out["steam_input_off"] = conf.get("steam_input_off") or []
+        print(json.dumps(out, indent=2))
+        return 0
+    if cmd == "nintendo":
+        # nintendo on|off|forget [--app N]: Nintendo mode for that game;
+        # forget = follow PCGamingWiki again. Takes effect at its next launch.
+        want = argv[1] if len(argv) > 1 else ""
+        if want not in ("on", "off", "forget") or not g or g["app"] in STEAM_UI or g["app"] >= 0x80000000:
+            print("nintendo on|off|forget [--app N] (a Steam game)", file=sys.stderr)
+            return 2
+        entry = conf["apps"].setdefault(str(g["app"]), {})
+        if want == "forget":
+            entry.pop("nintendo", None)
+        else:
+            entry["nintendo"] = want == "on"
+            entry.setdefault("name", g["title"] or g["class"])
+        entry.pop("mode", None)           # the layout follows the mode again
+        if not entry:
+            conf["apps"].pop(str(g["app"]), None)
+        save_conf(conf)
+        on, why = nintendo_for(conf, g["app"])
+        print(json.dumps({"nintendo": on, "because": why, "for": g["app"], "title": g["title"]}))
+        return 0
+    if cmd == "default":
+        if len(argv) < 2 or argv[1] not in MODES:
+            print("default letters|positions", file=sys.stderr)
+            return 2
+        conf["default"] = argv[1]
+        save_conf(conf)
+        print(json.dumps({"default": argv[1]}))
+        return 0
+    if cmd == "classify":
+        if "--selftest" in argv:
+            failed = 0
+            for app, (mode, ident) in SELFTEST.items():
+                r = classify(app) or {}
+                ok = r.get("mode") == mode and r.get("identity") == ident
+                failed += 0 if ok else 1
+                print(f"{'ok  ' if ok else 'FAIL'} {app} {r.get('name', '?')}: {r.get('mode')}, "
+                      f"{r.get('identity')} ({r.get('why')}); want {mode}, {ident}")
+            print(f"selftest: {failed} failed")
+            return 1 if failed else 0
+        app = g["app"] if g else 0
+        print(json.dumps({"app": app, "auto": classify(app)}))
+        return 0
+    if cmd == "identity":
+        # identity switch-pro|deck [--app N]: that game's identity, or with no
+        # game (or --default) the default; identity forget [--app N] drops a
+        # game's choice
+        want = argv[1] if len(argv) > 1 else ""
+        if want == "forget":
+            if g and str(g["app"]) in conf["apps"]:
+                conf["apps"][str(g["app"])].pop("identity", None)
+                save_conf(conf)
+            print(json.dumps({"identity_forgot": g["app"] if g else None}))
+            return 0
+        if want not in IDENTITIES:
+            print("identity switch-pro|deck|forget [--app N]", file=sys.stderr)
+            return 2
+        if g and g["app"] not in STEAM_UI and "--default" not in argv:
+            entry = conf["apps"].setdefault(str(g["app"]), {})
+            entry["identity"] = want
+            entry.setdefault("name", g["title"] or g["class"])
+            print(json.dumps({"identity": want, "for": g["app"], "title": g["title"]}))
+        else:
+            conf["identity"] = want
+            print(json.dumps({"identity_default": want}))
+        save_conf(conf)
+        return 0
+    if not g or g["app"] in STEAM_UI:
+        print("no game: start one first", file=sys.stderr)
+        return 2
+    by_class = "--class" in argv
+    if by_class and not g["class"]:
+        print("the game's window has no class yet: bring it to the front once", file=sys.stderr)
+        return 2
+    if cmd == "flip":
+        cur, _ = decide(conf, g["app"], g["class"], g.get("cmd", ""))
+        want = "positions" if cur == "letters" else "letters"
+    elif cmd == "set" and len(argv) > 1 and argv[1] in MODES:
+        want = argv[1]
+    elif cmd == "forget":
+        if by_class:
+            conf["classes"].pop(g["class"], None)
+        else:
+            entry = conf["apps"].get(str(g["app"]))
+            if isinstance(entry, dict) and "identity" in entry:
+                entry.pop("mode", None)      # keep its identity choice
+            else:
+                conf["apps"].pop(str(g["app"]), None)
+        save_conf(conf)
+        print(json.dumps({"forgot": g["class"] if by_class else g["app"]}))
+        return 0
+    else:
+        print(__doc__, file=sys.stderr)
+        return 2
+    if by_class:
+        conf["classes"][g["class"]] = want
+    else:
+        entry = conf["apps"].setdefault(str(g["app"]), {})
+        entry.update({"mode": want, "name": g["title"] or g["class"]})
+    save_conf(conf)
+    print(json.dumps({"layout": want, "for": g["class"] if by_class else g["app"],
+                      "title": g["title"]}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(cli(sys.argv[1:]))

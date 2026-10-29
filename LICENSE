@@ -1,0 +1,15 @@
+This repository holds work under several licenses. The full texts are in LICENSES/, and each of those texts keeps its own terms.
+
+All Markdown files (README.md, CREDITS.md, AGENTS.md, docs/, and the README.md files in art/ and reference/), art/ (the SVG drawings and icons, the PNG previews) and docs/images/:
+  Creative Commons Attribution 4.0 International (CC-BY-4.0), Copyright (c) 2026 Ryan Zegalia.
+  The screenshots in docs/images/ show Steam's interface (Valve) and Hades (Supergiant Games). They are included only to document what the code does; those interfaces belong to their owners and are not covered by this license.
+
+art/tools/, reference/thorlook/, reference/fatterpad/, reference/tools/, reference/gyro/, and the scripts and tools in reference/kernel/:
+  MIT, Copyright (c) 2026 Ryan Zegalia.
+  Exception: the Decky API connection block at the top of reference/thorlook/decky/index.template.js (and of the dist/index.js that build.py makes from it) and of reference/fatterpad/decky/dist/index.js comes from @decky/api (SteamDeckHomebrew/loader-api) and is LGPL-2.1.
+
+reference/inputplumber/patches/:
+  GNU General Public License v3.0 (GPL-3.0), the license of InputPlumber (ShadowBlip), which these patches modify. Copyright (c) 2026 Ryan Zegalia for the changes.
+
+reference/kernel/ patches, device-tree patches and kernel config fragment:
+  GNU General Public License v2.0 (GPL-2.0), the license of the Linux kernel they modify. Patches taken from other projects keep their authors' attribution in their headers.

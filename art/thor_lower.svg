@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640" fill="none" role="img" aria-labelledby="title"><title id="title">Thor lower controller</title>
+<g id="lower_body" stroke="#8B929A" stroke-width="1.6" fill="none" stroke-linejoin="round">
+<!-- Silhouette and the full-width hinge barrel. -->
+<path d="M81 52H919Q950 52 950 85V560Q950 600 908 600H92Q50 600 50 560V85Q50 52 81 52Z" fill="#0D131B"/>
+<path d="M80 61H920Q941 61 941 85V558Q941 590 909 590H682L674 551Q673 545 666 545H334Q327 545 326 551L318 590H91Q59 590 59 558V85Q59 61 80 61Z" stroke-opacity=".30" stroke-width="1"/>
+<g id="hinge"><rect x="52" y="34" width="896" height="31" rx="15.5" fill="#0D131B"/><path d="M153 35V64M847 35V64" stroke-opacity=".65"/><path d="M165 44H835" stroke-opacity=".23" stroke-width="1"/></g>
+<!-- Touch glass and active bottom display. -->
+<g id="screen_bottom"><rect x="267" y="85" width="466" height="450" rx="3" stroke-opacity=".32"/><rect x="277" y="97" width="446" height="426" rx="1.5" fill="#0D131B" stroke-opacity=".85"/></g>
+<g transform="translate(153 216)">
+  <circle r="77" stroke-opacity=".55" stroke-width="1.1" fill="none"/>
+  <g id="lstick_ring" fill="none" stroke-width="2.2" stroke-opacity=".42"><circle r="66.5"/></g>
+  <g id="lstick"><circle r="49" fill="#0D131B" stroke-width="2.05"/><circle r="41.5" fill="none" stroke-opacity=".4" stroke-width="1"/></g>
+</g>
+<g id="dpad" transform="translate(153 406)"><circle r="73" fill="none" stroke-opacity=".32"/><g id="dpad_up" transform="rotate(0)"><path d="M-19-62H19Q23-62 23-58V-26L0-4-23-26V-58Q-23-62-19-62Z" fill="#0D131B" stroke-linejoin="round"/><path d="M-6-43 0-50 6-43Z" fill="#8B929A" stroke="none" opacity=".62"/></g><g id="dpad_right" transform="rotate(90)"><path d="M-19-62H19Q23-62 23-58V-26L0-4-23-26V-58Q-23-62-19-62Z" fill="#0D131B" stroke-linejoin="round"/><path d="M-6-43 0-50 6-43Z" fill="#8B929A" stroke="none" opacity=".62"/></g><g id="dpad_down" transform="rotate(180)"><path d="M-19-62H19Q23-62 23-58V-26L0-4-23-26V-58Q-23-62-19-62Z" fill="#0D131B" stroke-linejoin="round"/><path d="M-6-43 0-50 6-43Z" fill="#8B929A" stroke="none" opacity=".62"/></g><g id="dpad_left" transform="rotate(270)"><path d="M-19-62H19Q23-62 23-58V-26L0-4-23-26V-58Q-23-62-19-62Z" fill="#0D131B" stroke-linejoin="round"/><path d="M-6-43 0-50 6-43Z" fill="#8B929A" stroke="none" opacity=".62"/></g></g>
+<circle cx="847" cy="216" r="80" stroke-opacity=".26"/>
+<g id="btn_x" transform="translate(847 164)"><circle r="25" fill="#0D131B"></circle><path d="M-7.8-10H-3.9L0-3.3 3.9-10H7.8L2 0 8.1 10H4.1L0 3-4.1 10H-8.1L-2 0Z" fill="#8B929A" fill-rule="evenodd" stroke="none" transform="scale(1.05)"/></g>
+<g id="btn_y" transform="translate(795 216)"><circle r="25" fill="#0D131B"></circle><path d="M-8.3-10H-4.4L0-2.2 4.4-10H8.3L1.7 1.6V10H-1.7V1.6Z" fill="#8B929A" fill-rule="evenodd" stroke="none" transform="scale(1.05)"/></g>
+<g id="btn_a" transform="translate(899 216)"><circle r="25" fill="#0D131B"></circle><path d="M-8 10-1.8-10H1.8L8 10H4.5L3 4.9H-3L-4.5 10ZM-2.1 1.8H2.1L0-5.5Z" fill="#8B929A" fill-rule="evenodd" stroke="none" transform="scale(1.05)"/></g>
+<g id="btn_b" transform="translate(847 268)"><circle r="25" fill="#0D131B"></circle><path d="M-6.8-10H.5Q6.6-10 6.6-4.8Q6.6-1.7 3.9-.5Q7.5.8 7.5 4.2Q7.5 10 .6 10H-6.8ZM-3.6-7.2V-1.9H.1Q3.3-1.9 3.3-4.6Q3.3-7.2.1-7.2ZM-3.6.9V7.2H.3Q4.2 7.2 4.2 4.1Q4.2.9.3.9Z" fill="#8B929A" fill-rule="evenodd" stroke="none" transform="scale(1.05)"/></g>
+<g transform="translate(847 406)">
+  <circle r="77" stroke-opacity=".55" stroke-width="1.1" fill="none"/>
+  <g id="rstick_ring" fill="none" stroke-width="2.2" stroke-opacity=".42"><circle r="66.5"/></g>
+  <g id="rstick"><circle r="49" fill="#0D131B" stroke-width="2.05"/><circle r="41.5" fill="none" stroke-opacity=".4" stroke-width="1"/></g>
+</g>
+<g id="btn_square" transform="translate(212 102)" color="#8B929A"><circle r="13" fill="#0D131B"/><g transform="scale(0.88)" stroke="none"><rect x="-7.2" y="-7.2" width="14.4" height="14.4" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/></g></g>
+<g id="btn_triangle" transform="translate(788 102)" color="#8B929A"><circle r="13" fill="#0D131B"/><g transform="scale(0.88)" stroke="none"><path d="M-5.7-8.2 8.4 0-5.7 8.2Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></g></g>
+<g id="btn_home" transform="translate(202 531)" color="#8B929A"><circle r="15" fill="#0D131B"/><g transform="scale(0.83)" stroke="none"><path d="M-10-1 0-9.8 10-1H7V8H-7V-1ZM-2.1 2V6.1H2.1V2Z" fill="currentColor" fill-rule="evenodd" stroke="none"/></g></g>
+<g id="btn_back_qam" transform="translate(798 531)" color="#8B929A"><circle r="15" fill="#0D131B"/><g transform="scale(0.83)" stroke="none"><path d="M6.5-5.8A8.2 8.2 0 1 0 8 1.8" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/><path d="M1.3-6.6 7.8-9.3 8.9-2.6Z" fill="currentColor" stroke="none"/></g></g>
+<g id="speakers" stroke-opacity=".56" stroke-width="1.2"><rect x="89" y="529" width="70" height="6" rx="3"/><rect x="841" y="529" width="70" height="6" rx="3"/></g>
+<!-- The inset front tab, its two unlabelled circles and the real AYN plate. -->
+<g id="front_tab"><path d="M331 598V558Q331 553 337 553H663Q669 553 669 558V598" stroke-opacity=".64"/>
+<g id="btn_front_left"><circle cx="355" cy="576" r="13" fill="#0D131B" stroke-opacity=".68"/></g>
+<g id="btn_front_right"><circle cx="645" cy="576" r="13" fill="#0D131B" stroke-opacity=".68"/></g>
+<g id="btn_ayn"><rect x="468" y="561" width="64" height="29" rx="5" fill="#0D131B" stroke-opacity=".82"/>
+<path d="M477 582 483 569 489 582M494 569 500 576 506 569M500 576V582M511 582V569L523 582V569" stroke-width="1.6" stroke-linecap="square" stroke-opacity=".85"/></g></g>
+</g>
+</svg>

@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""prompts-db: a local list of which Steam games ship Nintendo button prompts,
+from PCGamingWiki (FatterPad's per-game controller mode reads it at launch).
+
+For every Steam game the user owns (asked from the running Steam client over
+its local CEF debugger, via steam-cdp.py) it finds the game's PCGamingWiki
+page, reads the {{Input}} template and keeps the prompt fields in one JSON
+file, ~/.local/share/fatterpad/prompts.json:
+
+  {"version": 1, "updated": <unix time>,
+   "games": {"<appid>": {"name": "...", "page": "Hades" | null, "revid": 1812570,
+                         "nintendo_prompts": "true", "nintendo_button_layout": "limited",
+                         "nintendo_controllers": "true", "playstation_prompts": "true",
+                         "input_prompt_override": "false", "steam_input_prompts": "limited",
+                         "checked": <unix time>}}}
+
+Field values are the wiki's own words, lowercase: true, false, limited,
+hackable, always on, unknown, n/a, or "" (empty, or the page has no such
+field). "page": null means the wiki has no page for that appid (looked up
+again after 30 days). Games no longer owned stay in the file.
+
+Usage:
+  prompts-db update [--min-age H] [--limit N]
+                          add newly owned games, re-read pages whose wiki
+                          revision changed (a cheap batched revision check,
+                          skipped for pages verified in the last H hours,
+                          default 6), retry "no page" games older than 30 days.
+                          Steam not running: logs it and exits 0.
+  prompts-db get <appid>  that game's entry as JSON (null and exit 1 if none)
+  prompts-db status       counts: owned, mapped, nintendo_prompts true
+  --db PATH               another database file (before the command)
+
+Polite to a volunteer-run wiki: a User-Agent that says who we are, at most one
+request per second, 20 s total per request, exponential backoff on 429/5xx,
+and a clean stop (keeping what it has) after repeated failures.
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zlib
+
+HOME = os.path.expanduser("~")
+DB = f"{HOME}/.local/share/fatterpad/prompts.json"
+STEAM_CDP = os.environ.get("STEAM_CDP", f"{HOME}/.local/bin/steam-cdp.py")
+WIKI = "https://www.pcgamingwiki.com"
+UA = "FatterPad-prompts-db/0.1 (AYN Thor SteamOS controller helper)"
+# Owned Steam GAMES (app_type 1: not tools, soundtracks, demos or betas) from
+# the client's All Games collection; non-Steam shortcuts have ids >= 2^31.
+# Most played first, so an interrupted first run has covered the favorites.
+OWNED_JS = ("collectionStore.allGamesCollection.allApps"
+            ".filter(a => a.app_type === 1 && a.appid > 0 && a.appid < 2147483648)"
+            ".map(a => [a.appid, a.display_name, a.minutes_playtime_forever])")
+# {{Input}} template parameter -> key in the database
+FIELDS = {
+    "nintendo prompts": "nintendo_prompts",
+    "nintendo button layout": "nintendo_button_layout",
+    "nintendo controllers": "nintendo_controllers",
+    "playstation prompts": "playstation_prompts",
+    "input prompt override": "input_prompt_override",
+    "steam input prompts": "steam_input_prompts",
+}
+MIN_GAP = 1.0            # seconds between request starts (at most 1 per second)
+TIMEOUT = 20.0           # seconds, total, per request
+RETRIES = 4              # retries per request: waits of 2, 4, 8, 16 s
+MAX_FAILS = 3            # requests in a row that gave up -> stop the run
+BATCH = 50               # titles per query (the anonymous API limit)
+MAX_CONT = 20            # API continuation rounds per query
+MAX_BYTES = 32 << 20
+NO_PAGE_RETRY_S = 30 * 86400
+
+
+def log(msg: str) -> None:
+    print(f"prompts-db: {msg}", file=sys.stderr, flush=True)
+
+
+# -------------------------------------------------------------------- http --
+class Fail(Exception):
+    """One request gave up (the run goes on with the next one)."""
+
+
+class Abort(Exception):
+    """Repeated failures: stop the run, keep what we have."""
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None   # the 302 itself is the answer (HTTPError carries its headers)
+
+
+class Wiki:
+    """PCGamingWiki client: one request at a time, paced, with backoff."""
+
+    def __init__(self) -> None:
+        self.opener = urllib.request.build_opener(NoRedirect)
+        self.last = 0.0      # monotonic start of the previous request
+        self.requests = 0
+        self.fails = 0       # consecutive requests that gave up
+
+    def _once(self, url: str) -> tuple[int, object, bytes]:
+        wait = self.last + MIN_GAP - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self.last = time.monotonic()
+        self.requests += 1
+        deadline = self.last + TIMEOUT
+        req = urllib.request.Request(url, headers={
+            "User-Agent": UA, "Accept-Encoding": "gzip", "Accept": "application/json, */*"})
+        try:
+            resp = self.opener.open(req, timeout=TIMEOUT)
+        except urllib.error.HTTPError as e:
+            resp = e   # 3xx/4xx/5xx: a response all the same
+        try:
+            chunks, size = [], 0
+            while True:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"over {TIMEOUT:.0f} s")
+                part = resp.read(65536)
+                if not part:
+                    break
+                chunks.append(part)
+                size += len(part)
+                if size > MAX_BYTES:
+                    raise OSError("response too large")
+            body = b"".join(chunks)
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                body = gzip.decompress(body)
+            return resp.getcode(), resp.headers, body
+        finally:
+            resp.close()
+
+    def _giveup(self, msg: str) -> None:
+        self.fails += 1
+        if self.fails >= MAX_FAILS:
+            raise Abort(f"{self.fails} requests in a row failed (last: {msg})")
+        raise Fail(msg)
+
+    def get(self, url: str, as_json: bool = False, allow: tuple = ()):
+        """(status, headers, body); body is the parsed JSON with as_json.
+        Retries 429/5xx, network errors and bad JSON with exponential
+        backoff; any other 4xx is final (statuses in `allow` are answers)."""
+        delay, pause, why = 2.0, 0.0, ""
+        for attempt in range(RETRIES + 1):
+            if attempt:
+                time.sleep(min(pause or delay, 120.0))
+                delay *= 2
+            pause = 0.0
+            try:
+                status, headers, body = self._once(url)
+            except (OSError, EOFError, zlib.error) as e:
+                why = f"{type(e).__name__}: {e}"
+                continue
+            if status == 429 or status >= 500:
+                why = f"HTTP {status}"
+                ra = headers.get("Retry-After", "")
+                pause = float(ra) if ra.isdigit() else 0.0
+                continue
+            if status >= 400 and status not in allow:
+                self._giveup(f"HTTP {status}")
+            if as_json:
+                try:
+                    body = json.loads(body)
+                except ValueError:
+                    why = "not JSON (a challenge page?)"
+                    continue
+                if isinstance(body, dict) and "error" in body:
+                    why = f"API error {(body['error'] or {}).get('code')}"
+                    continue
+            self.fails = 0
+            return status, headers, body
+        self._giveup(why)
+
+
+# ------------------------------------------------------------------ wiki ---
+def page_from_location(loc: str | None) -> str | None:
+    """The page title in a /wiki/<Page_Title> Location header, or None."""
+    if not loc:
+        return None
+    u = urllib.parse.urlsplit(loc)
+    if u.path.startswith("/wiki/"):
+        title = urllib.parse.unquote(u.path[len("/wiki/"):])
+    elif u.path.endswith("/index.php"):
+        title = (urllib.parse.parse_qs(u.query).get("title") or [""])[0]
+    else:
+        return None
+    title = title.replace("_", " ").strip()
+    return None if not title or title.startswith("Special:") else title
+
+
+def lookup_page(wiki: Wiki, appid: int) -> str | None:
+    """appid -> page title. The answer is the 302 itself, so it is not followed;
+    no redirect (a 200 search page, or 404) means the wiki has no page."""
+    status, headers, _ = wiki.get(f"{WIKI}/api/appid.php?appid={appid}", allow=(404,))
+    return page_from_location(headers.get("Location")) if 300 <= status < 400 else None
+
+
+def query_pages(wiki: Wiki, titles: list[str], **extra: str) -> dict[str, dict | None]:
+    """action=query for up to 50 titles -> {requested title: page record or None}.
+    Follows API normalization, redirects and continuation."""
+    q = {"action": "query", "format": "json", "redirects": "1", "maxlag": "5",
+         "titles": "|".join(titles), **extra}
+    pages, norm, redir, cont = {}, {}, {}, {}
+    for _ in range(MAX_CONT):
+        data = wiki.get(f"{WIKI}/w/api.php?{urllib.parse.urlencode({**q, **cont})}", as_json=True)[2]
+        qd = data.get("query") or {}
+        norm.update({n["from"]: n["to"] for n in qd.get("normalized") or []})
+        redir.update({r["from"]: r["to"] for r in qd.get("redirects") or []})
+        for rec in (qd.get("pages") or {}).values():
+            have = pages.setdefault(rec.get("title"), rec)
+            if rec.get("revisions"):
+                have["revisions"] = rec["revisions"]
+        cont = data.get("continue") or {}
+        if not cont:
+            break
+    out = {}
+    for t in titles:
+        t2 = norm.get(t, t)
+        out[t] = pages.get(redir.get(t2, t2))
+    return out
+
+
+def current_revids(wiki: Wiki, titles: list[str]) -> dict[str, int | None]:
+    """Latest revision id per title (None: the page is gone). Cheap: no content."""
+    recs = query_pages(wiki, titles, prop="info")
+    return {t: (r or {}).get("lastrevid") for t, r in recs.items()}
+
+
+def read_pages(wiki: Wiki, titles: list[str]) -> dict[str, dict | None]:
+    """Page records with their wikitext; a batch that fails is split in halves."""
+    try:
+        return query_pages(wiki, titles, prop="revisions", rvprop="content|ids", rvslots="main")
+    except Fail as e:
+        if len(titles) <= 5:
+            raise
+        log(f"batch of {len(titles)} failed ({e}); trying halves")
+        half = len(titles) // 2
+        out = {}
+        for part in (titles[:half], titles[half:]):
+            try:
+                out.update(read_pages(wiki, part))
+            except Fail as e2:
+                log(f"{len(part)} pages skipped: {e2}")
+        return out
+
+
+def strip_markup(text: str) -> str:
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    return re.sub(r"<ref\b[^>]*/>|<ref\b[^>]*>.*?</ref>", "", text, flags=re.S | re.I)
+
+
+def input_params(text: str) -> dict[str, str]:
+    """The parameters of the page's first {{Input ...}} template, name -> value,
+    both lowercase with whitespace collapsed. Splits on the template's own
+    pipes only (not those inside nested {{...}} or [[...]])."""
+    text = strip_markup(text)
+    m = re.search(r"\{\{\s*input\s*(?=[|\r\n])", text, re.I)
+    if not m:
+        return {}
+    parts, start, depth, i = [], m.end(), 0, m.end()
+    while i < len(text):
+        two = text[i:i + 2]
+        if two in ("{{", "[["):
+            depth += 1
+            i += 2
+            continue
+        if two == "}}" and depth == 0:
+            break
+        if two in ("}}", "]]"):
+            depth = max(depth - 1, 0)
+            i += 2
+            continue
+        if text[i] == "|" and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+        i += 1
+    parts.append(text[start:i])
+    params = {}
+    for part in parts:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            params[" ".join(k.split()).lower()] = " ".join(v.split()).lower()
+    return params
+
+
+# ------------------------------------------------------------------- store --
+def blank(name: str) -> dict:
+    e = {"name": name, "page": None, "revid": None}
+    e.update({k: "" for k in FIELDS.values()})
+    e["checked"] = 0
+    return e
+
+
+def apply_page(e: dict, rec: dict | None, now: int) -> None:
+    """Fill an entry from the wiki's page record; no record or a missing page
+    leaves it as "no page" (looked up again in 30 days)."""
+    revs = (rec or {}).get("revisions") or []
+    if not revs:
+        e.update(blank(e["name"]))
+        e["checked"] = now
+        return
+    main = (revs[0].get("slots") or {}).get("main") or {}
+    params = input_params(main.get("*") or revs[0].get("*") or "")
+    e["revid"] = revs[0].get("revid")
+    for p, k in FIELDS.items():
+        e[k] = params.get(p, "")
+    e["checked"] = now
+
+
+def load_db(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            db = json.load(fh)
+    except (OSError, ValueError):
+        db = {}
+    if not isinstance(db.get("games"), dict):
+        db = {"version": 1, "updated": 0, "games": {}}
+    return db
+
+
+def save_db(path: str, db: dict) -> None:
+    db["updated"] = int(time.time())
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(db, fh, indent=1)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def take_lock(path: str):
+    """Only one update at a time (boot and daily runs can meet). None if busy."""
+    try:
+        import fcntl
+    except ImportError:
+        return True
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fh = open(f"{path}.lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+# ------------------------------------------------------------------- steam --
+def steam_owned() -> list[tuple[int, str, int]] | None:
+    """(appid, name, minutes played) of the owned Steam games, or None when
+    Steam cannot be asked (not running, not in Game Mode, no helper)."""
+    try:
+        r = subprocess.run(["python3", STEAM_CDP, OWNED_JS], capture_output=True,
+                           text=True, timeout=30)
+        rows = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if not isinstance(rows, list) or not rows:
+        return None
+    rows = [(int(a), str(n or a), int(p or 0)) for a, n, p in rows]
+    return sorted(rows, key=lambda x: -x[2])
+
+
+# ---------------------------------------------------------------- commands --
+def cmd_update(path: str, min_age: float, limit: int) -> int:
+    owned = steam_owned()
+    if owned is None:
+        log("Steam is not running (or not in Game Mode), nothing to do; the next run catches up")
+        return 0
+    lock = take_lock(path)
+    if lock is None:
+        log("another update is running")
+        return 0
+    started = time.time()
+    db = load_db(path)
+    games = db["games"]
+    wiki = Wiki()
+    stats = {"lookups": 0, "checked": 0, "changed": 0, "read": 0}
+    now = int(started)
+    for appid, name, _ in owned:
+        if str(appid) in games:
+            games[str(appid)]["name"] = name
+    want = [(a, n) for a, n, _ in owned
+            if str(a) not in games or (games[str(a)]["page"] is None
+                                       and now - games[str(a)]["checked"] >= NO_PAGE_RETRY_S)]
+    log(f"{len(owned)} games owned, {len(want)} to look up")
+    try:
+        # 1. appid -> wiki page
+        for n, (appid, name) in enumerate(want[:limit] if limit else want):
+            try:
+                page = lookup_page(wiki, appid)
+            except Fail as e:
+                log(f"{appid} {name!r}: {e}")
+                continue
+            e = games[str(appid)] = blank(name)
+            e["page"], e["checked"] = page, int(time.time())
+            stats["lookups"] += 1
+            if n % 25 == 24:
+                save_db(path, db)
+        save_db(path, db)
+        by_page: dict[str, list[dict]] = {}
+        for e in games.values():
+            if e["page"]:
+                by_page.setdefault(e["page"], []).append(e)
+        # 2. which known pages changed (revision ids only)
+        pending = [t for t, es in by_page.items() if any(e["revid"] is None for e in es)]
+        fresh = time.time() - min_age * 3600
+        owned_ids = {str(a) for a, _, _ in owned}
+        due = sorted({e["page"] for k, e in games.items() if k in owned_ids and e["page"]
+                      and e["revid"] is not None and e["checked"] <= fresh})
+        changed = []
+        for i in range(0, len(due), BATCH):
+            try:
+                revids = current_revids(wiki, due[i:i + BATCH])
+            except Fail as e:
+                log(f"revision check skipped for {len(due[i:i + BATCH])} pages: {e}")
+                continue
+            for t, rev in revids.items():
+                stats["checked"] += 1
+                if rev is not None and all(e["revid"] == rev for e in by_page[t]):
+                    for e in by_page[t]:
+                        e["checked"] = int(time.time())
+                else:
+                    changed.append(t)
+            save_db(path, db)
+        stats["changed"] = len(changed)
+        # 3. read new and changed pages
+        todo = list(dict.fromkeys(pending + changed))
+        for i in range(0, len(todo), BATCH):
+            batch = todo[i:i + BATCH]
+            try:
+                recs = read_pages(wiki, batch)
+            except Fail as e:
+                log(f"{len(batch)} pages not read: {e}")
+                continue
+            for t, rec in recs.items():
+                for e in by_page[t]:
+                    apply_page(e, rec, int(time.time()))
+                stats["read"] += 1
+            save_db(path, db)
+    except Abort as e:
+        log(f"stopping early: {e}; kept what it has, the next run goes on")
+    finally:
+        save_db(path, db)
+    left = sum(1 for e in games.values() if e["page"] and e["revid"] is None)
+    log(f"done in {time.time() - started:.0f} s, {wiki.requests} requests: "
+        f"{stats['lookups']} page lookups, {stats['checked']} revisions checked "
+        f"({stats['changed']} changed), {stats['read']} pages read; {left} read pending")
+    return 0
+
+
+def cmd_get(path: str, appid: int) -> int:
+    e = load_db(path)["games"].get(str(appid))
+    print(json.dumps(e, indent=1))
+    return 0 if e else 1
+
+
+def cmd_status(path: str) -> int:
+    db = load_db(path)
+    games = db["games"]
+    owned = steam_owned()
+    ids = {str(a) for a, _, _ in owned} if owned else set()
+    mapped = [e for e in games.values() if e["page"]]
+    yes = [e for e in mapped if e["nintendo_prompts"] == "true"]
+    print(f"db: {path}")
+    if db["updated"]:
+        print(f"updated: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(db['updated']))}")
+    print(f"owned: {len(owned) if owned else 'unknown (Steam not running)'}")
+    print(f"entries: {len(games)}")
+    print(f"mapped to a wiki page: {len(mapped)}")
+    print(f"no wiki page: {len(games) - len(mapped)}")
+    print(f"read pending: {sum(1 for e in mapped if e['revid'] is None)}")
+    if owned:
+        print(f"owned, not looked up yet: {len(ids - set(games))}")
+    print(f"nintendo_prompts true: {len(yes)}")
+    return 0
+
+
+def cli(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="prompts-db", description=__doc__.split("\n")[0])
+    ap.add_argument("--db", default=DB, help="database file (default %(default)s)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    up = sub.add_parser("update", help="add new games, re-read changed pages")
+    up.add_argument("--min-age", type=float, default=6.0, metavar="H",
+                    help="skip the revision check for pages verified in the last H hours (default 6)")
+    up.add_argument("--limit", type=int, default=0, metavar="N",
+                    help="look up at most N new games this run (default: all)")
+    g = sub.add_parser("get", help="print one game's entry as JSON")
+    g.add_argument("appid", type=int)
+    sub.add_parser("status", help="print counts")
+    a = ap.parse_args(argv)
+    if a.cmd == "update":
+        return cmd_update(a.db, a.min_age, a.limit)
+    if a.cmd == "get":
+        return cmd_get(a.db, a.appid)
+    return cmd_status(a.db)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # save what we have on kill
+    sys.exit(cli(sys.argv[1:]))

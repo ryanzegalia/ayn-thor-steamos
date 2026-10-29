@@ -1,0 +1,10 @@
+[Unit]
+Description=FatterPad: refresh the Nintendo-prompt list a few minutes after boot and twice a day
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=12h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

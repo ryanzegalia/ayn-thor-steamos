@@ -1,0 +1,27 @@
+From: Ryan Zegalia <ryanzegalia@gmail.com>
+Subject: [PATCH] arm64: dts: qcom: qcs8550-ayn-thor: the lid wakes on both edges
+
+pb-os 788b192 (from Armada) made the hall lid sensor wake only on the
+lid-open edge (EV_ACT_DEASSERTED), so a lid closed on a Thor put to sleep
+with the power key would not wake it. On our kernel that left a Thor put
+to sleep with the lid open (power key or Steam's idle timer) unwakeable
+by the lid at all: closed, then opened, nothing until the power key
+(2026-10-20 13:53, battery, deep sleep).
+
+Wake on any edge (EV_ACT_ANY, as ROCKNIX's Thor DT has it; gpio-keys then
+keeps the line's both-edges trigger through suspend). A lid closed on a
+sleeping Thor wakes it for a moment; a userspace helper on my Thor (not in this repo) sends it
+straight back to deep sleep, now with the lid closed, from where opening
+the lid wakes it. The pull-up (hall_lid_n) stays.
+---
+--- a/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts
++++ b/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts
+@@ -40,7 +40,7 @@
+ 			linux,input-type = <EV_SW>;
+ 			linux,code = <SW_LID>;
+ 			linux,can-disable;
+-			wakeup-event-action = <EV_ACT_DEASSERTED>;
++			wakeup-event-action = <EV_ACT_ANY>;
+ 			wakeup-source;
+ 		};
+ 	};

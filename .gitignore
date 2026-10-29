@@ -1,0 +1,4 @@
+reference/thorlook/decky/dist/
+__pycache__/
+*.pyc
+art/tools/chrome-profile/

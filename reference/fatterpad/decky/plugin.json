@@ -1,0 +1,17 @@
+{
+  "name": "FatterPad",
+  "author": "Ryan Zegalia",
+  "api_version": 1,
+  "flags": [],
+  "version": "1.0.0",
+  "publish": {
+    "tags": [
+      "ayn",
+      "thor",
+      "controller",
+      "abxy"
+    ],
+    "description": "Per-game face buttons on the AYN Thor: Xbox layout by default (when a game says A, press the bottom button), Nintendo layout (the printed A on the right is A) per game or per emulator. Front end for fatterpad-abxy.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/decky-loader"
+  }
+}

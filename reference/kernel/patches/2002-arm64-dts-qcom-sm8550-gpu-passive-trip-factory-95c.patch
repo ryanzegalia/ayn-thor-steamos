@@ -1,0 +1,87 @@
+From: Ryan Zegalia <ryanzegalia@gmail.com>
+Subject: [PATCH] arm64: dts: qcom: sm8550: GPU passive trip at the factory 95 C
+
+The eight gpuss zones brake the GPU (devfreq cooling) at a passive trip of
+85 C. On the actively cooled AYN Thor that brake held the GPU below its
+680 MHz top for 70 % of a sustained load with the fan at full speed
+(2026-10-20, 615/680 MHz flapping). The Thor's own Android device tree
+(AYN vendor_boot, Kalama QCM and KalamaP QCS tables) throttles the GPU at
+a 95 C junction limit (tj_cfg, all eight gpuss zones, bound to kgsl).
+
+Use the factory 95 C. The hot (90 C) and critical (110 C, shutdown) trips
+are unchanged, as are the CPU zones (hardware LMh limits the CPU).
+---
+--- a/arch/arm64/boot/dts/qcom/sm8550.dtsi	2026-10-20 09:25:09.629798791 -0400
++++ b/arch/arm64/boot/dts/qcom/sm8550.dtsi	2026-10-20 09:25:09.630333433 -0400
+@@ -6938,7 +6938,7 @@
+ 
+ 			trips {
+ 				gpu0_alert0: trip-point0 {
+-					temperature = <85000>;
++					temperature = <95000>;
+ 					hysteresis = <1000>;
+ 					type = "passive";
+ 				};
+@@ -6971,7 +6971,7 @@
+ 
+ 			trips {
+ 				gpu1_alert0: trip-point0 {
+-					temperature = <85000>;
++					temperature = <95000>;
+ 					hysteresis = <1000>;
+ 					type = "passive";
+ 				};
+@@ -7004,7 +7004,7 @@
+ 
+ 			trips {
+ 				gpu2_alert0: trip-point0 {
+-					temperature = <85000>;
++					temperature = <95000>;
+ 					hysteresis = <1000>;
+ 					type = "passive";
+ 				};
+@@ -7037,7 +7037,7 @@
+ 
+ 			trips {
+ 				gpu3_alert0: trip-point0 {
+-					temperature = <85000>;
++					temperature = <95000>;
+ 					hysteresis = <1000>;
+ 					type = "passive";
+ 				};
+@@ -7070,7 +7070,7 @@
+ 
+ 			trips {
+ 				gpu4_alert0: trip-point0 {
+-					temperature = <85000>;
++					temperature = <95000>;
+ 					hysteresis = <1000>;
+ 					type = "passive";
+ 				};
+@@ -7103,7 +7103,7 @@
+ 
+ 			trips {
+ 				gpu5_alert0: trip-point0 {
+-					temperature = <85000>;
++					temperature = <95000>;
+ 					hysteresis = <1000>;
+ 					type = "passive";
+ 				};
+@@ -7136,7 +7136,7 @@
+ 
+ 			trips {
+ 				gpu6_alert0: trip-point0 {
+-					temperature = <85000>;
++					temperature = <95000>;
+ 					hysteresis = <1000>;
+ 					type = "passive";
+ 				};
+@@ -7169,7 +7169,7 @@
+ 
+ 			trips {
+ 				gpu7_alert0: trip-point0 {
+-					temperature = <85000>;
++					temperature = <95000>;
+ 					hysteresis = <1000>;
+ 					type = "passive";
+ 				};

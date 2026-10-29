@@ -1,0 +1,9 @@
+# Cross build host for the Thor kernel: pb-os's build-gcc15.sh package list
+# (Fedora 43, GCC 15, pahole >= 1.26) plus Fedora's aarch64 cross GCC, so the
+# recipe runs on x86_64 instead of an aarch64 VM. dtc is for DTB diffs.
+FROM docker.io/library/fedora:43
+RUN dnf -y install file gcc make bc bison flex python3 curl tar xz gzip cpio kmod \
+      patch perl rsync openssl-devel elfutils-libelf-devel dwarves diffutils \
+      findutils hostname which git dtc \
+      gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+ && dnf clean all

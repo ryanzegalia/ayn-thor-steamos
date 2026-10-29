@@ -1,0 +1,12 @@
+{
+  "name": "ThorLook",
+  "author": "Ryan Zegalia",
+  "api_version": 1,
+  "flags": ["root"],
+  "version": "1.0.0",
+  "publish": {
+    "tags": ["ayn", "thor", "controller", "theme"],
+    "description": "Steam draws the AYN Thor itself (not a Switch Pro) in its controller screens, and the Thor's own button icons in its prompts. Runtime CSS only; Steam's files are not edited.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/decky-loader"
+  }
+}

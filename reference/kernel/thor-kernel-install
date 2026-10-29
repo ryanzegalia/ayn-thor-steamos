@@ -1,0 +1,96 @@
+#!/bin/bash
+# SteamOS side: install a kernel built by build-thor-kernel.sh, additively.
+#
+#   thor-kernel-install STAGE --check    verify the stage and the device, change nothing
+#   thor-kernel-install STAGE --prepare  modules dir + KERNEL.known-good (no swap)
+#   thor-kernel-install STAGE --swap     prepare, then replace /boot/KERNEL (no reboot)
+#
+# STAGE (e.g. ~/kernel-stage/7.2.8-sm8550-ff1) holds KERNEL, KERNEL.md5,
+# modules-<release>.tar.gz and SHA256SUMS from the build. Nothing existing is
+# overwritten: the new release gets its own /lib/modules/<release>, firmware is
+# not touched, the running kernel's modules stay, and /boot/KERNEL is copied
+# to KERNEL.known-good (+.md5) before the one-file swap. Undo: thor-kernel-rollback.
+set -euo pipefail
+B=/boot
+LOG=/home/steamos/thor-kernel-install.log
+[[ $EUID == 0 ]] || exec sudo "$0" "$@"
+
+die() { echo "thor-kernel-install: $*" >&2; exit 1; }
+say() { echo "$*"; echo "$(date -Is) $*" >>"$LOG"; }
+md5of() { md5sum "$1" | awk '{print $1}'; }
+
+S="${1:-}"; MODE="${2:-}"
+[[ -d "$S" && "$MODE" =~ ^--(check|prepare|swap)$ ]] || die "usage: thor-kernel-install STAGE --check|--prepare|--swap"
+cd "$S"
+
+# --- stage ---------------------------------------------------------------
+sha256sum -c --quiet SHA256SUMS || die "stage does not match SHA256SUMS"
+[[ "$(md5of KERNEL)" == "$(awk '{print $1}' KERNEL.md5)" ]] || die "KERNEL does not match KERNEL.md5"
+tgz=$(ls modules-*.tar.gz); REL=${tgz#modules-}; REL=${REL%.tar.gz}
+[[ "$REL" =~ ^7\.[0-9]+\.[0-9]+-sm8550-ff[0-9]+$ ]] || die "odd release name $REL"
+[[ "$REL" != "$(uname -r)" ]] || die "$REL is the running kernel"
+[[ "$(tar -tzf "$tgz" | cut -d/ -f1 | sort -u)" == "$REL" ]] || die "$tgz holds more than $REL/"
+info=$(python3 /usr/bin/ufs-bootimg.py info KERNEL)
+grep -q 'ID_OK=yes' <<<"$info" || die "ufs-bootimg info: header id wrong"
+grep -q 'PARTLABEL_ROOT=yes' <<<"$info" || die "ufs-bootimg info: root is not PARTLABEL="
+newcmd=$(python3 "$S/bootimg-tool.py" info KERNEL | sed -n 's/^cmdline=//p')
+[[ "$newcmd" == "$(cat /proc/cmdline)" ]] || die "new cmdline differs from the running one: $newcmd"
+python3 "$S/bootimg-tool.py" info KERNEL | grep -q '^dtb\[0\] .* AYN Thor$' || die "first DTB is not the AYN Thor"
+echo "stage OK: $REL, KERNEL $(md5of KERNEL), cmdline = running cmdline"
+
+# --- device --------------------------------------------------------------
+mountpoint -q $B && [[ "$(findmnt -no SOURCE $B)" == "$(blkid -t PARTLABEL=ROCKNIX -o device | head -1)" ]] || die "$B is not ROCKNIX"
+grep -q ' root=PARTLABEL=STORAGE ' /proc/cmdline || die "not booted from internal STORAGE"
+cur=$(md5of $B/KERNEL)
+if [[ -f $B/KERNEL.known-good ]]; then
+  kg=$(awk '{print $1}' $B/KERNEL.known-good.md5)
+  [[ "$(md5of $B/KERNEL.known-good)" == "$kg" ]] || die "KERNEL.known-good does not match its md5"
+  echo "known-good: present ($kg)"
+else
+  kg=""
+  [[ "$cur" == "$(awk '{print $1}' $B/KERNEL.md5)" ]] || die "/boot/KERNEL does not match /boot/KERNEL.md5"
+  echo "known-good: not yet saved (current KERNEL $cur, running $(uname -r))"
+fi
+M=/usr/lib/modules/$REL
+if [[ -e $M ]]; then echo "modules: $M exists"; else echo "modules: $M to be added"; fi
+free=$(df --output=avail -B1 $B | tail -1)
+(( free > 3 * $(stat -c %s KERNEL) )) || die "not enough room on $B"
+[[ "$MODE" == --check ]] && { echo "CHECK OK (nothing changed)"; exit 0; }
+
+# --- prepare: additive only ----------------------------------------------
+if [[ -z "$kg" ]]; then
+  cp $B/KERNEL $B/KERNEL.known-good.tmp; sync
+  [[ "$(md5of $B/KERNEL.known-good.tmp)" == "$cur" ]] || { rm -f $B/KERNEL.known-good.tmp; die "known-good copy did not verify"; }
+  mv $B/KERNEL.known-good.tmp $B/KERNEL.known-good
+  echo "$cur  KERNEL.known-good" >$B/KERNEL.known-good.md5; sync
+  kg=$cur
+  say "saved /boot/KERNEL.known-good = $kg ($(uname -r))"
+fi
+if [[ ! -e $M ]]; then
+  t=$(mktemp -d /usr/lib/modules/.stage-XXXX)
+  tar -C "$t" -xzf "$tgz"
+  depmod -b "$t" "$REL" 2>/dev/null || true
+  mv "$t/$REL" "$M"; rmdir "$t"
+  say "added $M ($(find "$M" -name '*.ko*' | wc -l) modules)"
+else
+  # Must be this build's modules, never a mix (mixed = black screen).
+  ref=$(tar -xzOf "$tgz" "$REL/modules.order" | md5sum | awk '{print $1}')
+  [[ "$(md5sum <"$M/modules.order" | awk '{print $1}')" == "$ref" ]] || die "$M is from another build"
+fi
+[[ "$MODE" == --prepare ]] && { echo "PREPARE OK (KERNEL not swapped)"; exit 0; }
+
+# --- swap -----------------------------------------------------------------
+online=$(cat /sys/class/power_supply/qcom-battmgr-usb/online 2>/dev/null || echo 0)
+cap=$(cat /sys/class/power_supply/battery/capacity)
+[[ "$online" == 1 ]] || die "plug in the charger first"
+(( cap > 50 )) || die "battery $cap% (need > 50)"
+[[ -z "$(ps -eo comm=,args= | awk '$1=="reaper" && /SteamLaunch AppId=/')" ]] || die "a game is running"
+new=$(md5of KERNEL)
+cp KERNEL $B/KERNEL.new; sync
+[[ "$(md5of $B/KERNEL.new)" == "$new" ]] || { rm -f $B/KERNEL.new; die "KERNEL.new did not verify"; }
+mv -f $B/KERNEL.new $B/KERNEL
+echo "$new  KERNEL" >$B/KERNEL.md5
+sync; echo 3 >/proc/sys/vm/drop_caches
+[[ "$(md5of $B/KERNEL)" == "$new" ]] || die "KERNEL does not read back as $new: run thor-kernel-rollback now"
+say "swapped /boot/KERNEL -> $REL ($new); known-good $kg kept"
+echo "SWAP OK. Reboot to try it; undo with: ~/bin/thor-kernel-rollback --reboot"

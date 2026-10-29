@@ -1,0 +1,98 @@
+From: Ryan Zegalia <ryanzegalia@gmail.com>
+Subject: [PATCH] PCI: qcom: arm the Root Port's WAKE# as a system wake interrupt
+
+The AYN Thor's WCN7850 (ath12k) supports wake-on-WLAN, and with a magic
+packet trigger armed (iw phy phy0 wowlan show: enabled) its firmware stays
+in WoW through deep sleep and resumes cleanly. But the SoC never wakes on
+it: the Root Port node carries wake-gpios (TLMM 96, which is in SM8550's
+PDC wake map as { 96, 109 }), and pcie-qcom never requests it, so WAKE#
+has no interrupt (2026-10-20 test: only the RTC alarm woke the Thor).
+
+Request wake-gpios from each Root Port node, make it a dedicated wake IRQ
+of the host (falling edge, as pcie-stm32 does) and enable wakeup on the
+host device. A missing or unusable WAKE# only logs; the probe never fails.
+The probe defers and retries on SM8550, so a devm action clears the wake
+IRQ and wakeup when a try unwinds (the first version leaked them: the
+final try got -EBUSY and wake stayed off, ff3 2026-10-20).
+---
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -27,6 +27,7 @@
+ #include <linux/pci-pwrctrl.h>
+ #include <linux/pm_opp.h>
+ #include <linux/pm_runtime.h>
++#include <linux/pm_wakeirq.h>
+ #include <linux/platform_device.h>
+ #include <linux/phy/pcie.h>
+ #include <linux/phy/phy.h>
+@@ -1949,6 +1950,61 @@
+ 	return 0;
+ }
+ 
++/*
++ * The Root Port's WAKE# (wake-gpios) as a dedicated system wake interrupt, so an endpoint armed
++ * for wake (a WCN7850 with wake-on-WLAN) can bring the SoC out of deep sleep. Without it the
++ * endpoint asserts WAKE# and nothing listens. Never fails the probe: without a usable WAKE# the
++ * port works as before, only without wake. Modeled on pcie-stm32.c.
++ *
++ * The probe defers and runs again (seen on SM8550: three tries), and the wake IRQ is not
++ * device-managed: a devm action drops it (and wakeup) when a try unwinds, before the GPIO
++ * goes. Without that the next try found IRQ busy (-EBUSY) and wake stayed off.
++ */
++static void qcom_pcie_drop_wake(void *data)
++{
++	struct device *dev = data;
++
++	dev_pm_clear_wake_irq(dev);
++	device_init_wakeup(dev, false);
++}
++
++static void qcom_pcie_parse_wake(struct qcom_pcie *pcie, struct device_node *node)
++{
++	struct device *dev = pcie->pci->dev;
++	struct gpio_desc *wake;
++	int irq, ret;
++
++	wake = devm_fwnode_gpiod_get(dev, of_fwnode_handle(node), "wake", GPIOD_IN, "PCIe WAKE#");
++	if (IS_ERR(wake)) {
++		if (PTR_ERR(wake) != -ENOENT)
++			dev_warn(dev, "WAKE# GPIO unavailable: %ld\n", PTR_ERR(wake));
++		return;
++	}
++
++	irq = gpiod_to_irq(wake);
++	if (irq < 0) {
++		dev_warn(dev, "WAKE# GPIO has no IRQ: %d\n", irq);
++		return;
++	}
++
++	irq_set_irq_type(irq, IRQ_TYPE_EDGE_FALLING);
++	device_init_wakeup(dev, true);
++	ret = dev_pm_set_dedicated_wake_irq(dev, irq);
++	if (ret) {
++		dev_warn(dev, "WAKE# not set as wake IRQ: %d\n", ret);
++		device_init_wakeup(dev, false);
++		return;
++	}
++
++	ret = devm_add_action_or_reset(dev, qcom_pcie_drop_wake, dev);
++	if (ret) {
++		dev_warn(dev, "WAKE# cleanup not registered: %d\n", ret);
++		return;
++	}
++
++	dev_info(dev, "WAKE# armed for system wake (IRQ %d)\n", irq);
++}
++
+ static int qcom_pcie_parse_port(struct qcom_pcie *pcie, struct device_node *node)
+ {
+ 	struct device *dev = pcie->pci->dev;
+@@ -1977,6 +2033,8 @@
+ 	/* TODO: Move to DWC core after multi Root Port support is added */
+ 	of_property_read_u32(node, "t-power-on-us", &port->l1ss_t_power_on);
+ 
++	qcom_pcie_parse_wake(pcie, node);
++
+ 	port->phy = phy;
+ 	INIT_LIST_HEAD(&port->list);
+ 	list_add_tail(&port->list, &pcie->ports);

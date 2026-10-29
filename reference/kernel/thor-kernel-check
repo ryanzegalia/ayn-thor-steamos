@@ -1,0 +1,46 @@
+#!/bin/bash
+# Read-only health snapshot of the SteamOS side, one `key=value` per line, so
+# a run on the old kernel and one on the new kernel can be diffed:
+#   thor-kernel-check > ~/kernel-check-$(uname -r).txt
+#   diff ~/kernel-check-7.2.8-sm8550-steamos.txt ~/kernel-check-7.2.8-sm8550-ff1.txt
+# Changes nothing. Touch, rumble feel and the 80% stop still need hands/time.
+[[ $EUID == 0 ]] || exec sudo "$0" "$@"
+dt=/sys/firmware/devicetree/base
+kv() { printf '%s=%s\n' "$1" "$2"; }
+hexdt() { [[ -e "$1" ]] && xxd -p "$1" | tr -d '\n' || echo absent; }
+
+kv kernel "$(uname -r)"
+kv cmdline_root "$(grep -o 'root=[^ ]*' /proc/cmdline)"
+kv dt_model "$(tr -d '\0' <$dt/model)"
+kv failed_system "$(systemctl --failed --no-legend --plain | awk '{print $1}' | sort | xargs)"
+kv failed_user "$(runuser -u steamos -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sort | xargs)"
+for s in inputplumber sm8550-thor-backlightd sm8550-thor-controlsd sm8550-powerbuttond sm8550-fand steamos-manager plugin_loader bluetooth NetworkManager tailscaled sshd; do
+  kv "svc_$s" "$(systemctl is-active $s 2>/dev/null)"
+done
+kv remoteprocs "$(for r in /sys/class/remoteproc/*; do printf '%s:%s:%s ' "$(cat $r/name)" "$(cat $r/state)" "$(cat $r/firmware)"; done)"
+kv fastrpc "$(ls /dev/fastrpc* 2>/dev/null | xargs)"
+kv sound_cards "$(sed -n 's/^ *\([0-9]\+\) \[\([^]]*\)\].*/\1:\2/p' /proc/asound/cards | xargs)"
+kv wlan0 "$(cat /sys/class/net/wlan0/operstate 2>/dev/null)"
+PING_HOST="${PING_HOST:-CHANGE-ME-a-host-on-your-LAN}"   # placeholder: set to something on your network
+kv wifi_ping "$(ping -c1 -W2 "$PING_HOST" >/dev/null 2>&1 && echo ok || echo fail)"
+kv bt_powered "$(bluetoothctl show 2>/dev/null | awk '/Powered:/{print $2}')"
+kv drm "$(for c in /sys/class/drm/card*-*; do printf '%s:%s ' "${c##*/}" "$(cat $c/status)"; done)"
+kv backlights "$(for b in /sys/class/backlight/*; do printf '%s:%s/%s ' "${b##*/}" "$(cat $b/brightness)" "$(cat $b/max_brightness)"; done)"
+kv input "$(grep '^N: Name=' /proc/bus/input/devices | sed 's/N: Name="\(.*\)"/\1/' | sort | paste -sd'|')"
+for d in /sys/bus/i2c/devices/*-0038; do
+  n=$(readlink -f $d/of_node)
+  kv "touch_${d##*/}" "$(cat $d/name) sx=$(hexdt $n/touchscreen-size-x) sy=$(hexdt $n/touchscreen-size-y) swap=$( [[ -e $n/touchscreen-swapped-x-y ]] && echo yes || echo no) invx=$( [[ -e $n/touchscreen-inverted-x ]] && echo yes || echo no) invy=$( [[ -e $n/touchscreen-inverted-y ]] && echo yes || echo no)"
+done
+kv panel_rotation "$(for p in $dt/soc@0/display-subsystem@*/dsi@*/panel@0/rotation; do hexdt $p; printf ' '; done)"
+h=$(ls -d $dt/soc@0/spmi@*/pmic@*/qcom,hv-haptics@* 2>/dev/null | head -1)
+[[ -z "$h" ]] && h=$(grep -l 'qcom,hv-haptics' $(find $dt/ -maxdepth 6 -name compatible 2>/dev/null) 2>/dev/null | head -1 | xargs -r dirname)
+kv haptics "node=${h##*/} use_erm=$( [[ -e $h/qcom,use-erm ]] && echo yes || echo no) vmax=$(hexdt $h/qcom,vmax-mv)"
+kv fastrpc_sensors_pdr "$( [[ -n "$(find $dt/ -maxdepth 8 -name qcom,fastrpc-adsp-sensors-pdr 2>/dev/null | head -1)" ]] && echo yes || echo no)"
+B=/sys/class/power_supply/battery
+kv battery "cap=$(cat $B/capacity) status=$(cat $B/status) uA=$(cat $B/current_now 2>/dev/null) end_thr=$(cat $B/charge_control_end_threshold 2>/dev/null || echo none) ccmax=$(cat $B/constant_charge_current_max 2>/dev/null || echo none)"
+kv usb_online "$(cat /sys/class/power_supply/qcom-battmgr-usb/online 2>/dev/null)"
+kv mem_sleep "$(cat /sys/power/mem_sleep)"
+kv iio "$(ls /sys/bus/iio/devices 2>/dev/null | xargs)"
+kv modules_loaded "$(lsmod | awk 'NR>1{print $1}' | sort | xargs | md5sum | cut -c1-12) n=$(lsmod | tail -n +2 | wc -l)"
+kv dmesg_errors "$(dmesg --level=err,crit,alert,emerg 2>/dev/null | wc -l)"
+kv steam_pads "$(command -v thor-steam-pads >/dev/null && thor-steam-pads 2>/dev/null | head -3 | tr '\n' ' ')"
