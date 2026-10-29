@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""thor-motiond: the Thor's accelerometer and gyroscope (SH5001 behind the
+ADSP sensor hub) as one uinput motion device, "Thor Motion Sensors", which
+our InputPlumber fork folds into the Thor's controller (its evdev IMU
+source), so a controller identity that carries motion (Switch Pro) gets real
+gyro. Ours, in Python; pb-os's pbos-motiond (C++, Steam Deck pad) was read
+for the protocol and the frame, not installed.
+
+  thor-motiond            run (needs thor-sensors serving the ADSP)
+  thor-motiond --dump     print samples (sensor frame and controller frame)
+
+Also a DSU (cemuhook) server on 127.0.0.1:26760 for emulator motion.
+
+Output follows hid-playstation's motion sensors: INPUT_PROP_ACCELEROMETER,
+ABS_X/Y/Z acceleration at 8192 per g, ABS_RX/RY/RZ angular velocity at 1024
+per deg/s, MSC_TIMESTAMP in us. Frame: x right, y toward the top of the
+screen, z out of the screen. The Thor's panels are portrait, so its sensor
+frame is a quarter turn off: x = -sensor y, y = sensor x, z = sensor z (the
+frame pb-os, MaSi and Batocera validated on a Thor). The gyro's zero is
+learned while the device lies still and kept in /var/lib/thor-sensors.
+Around suspend the streams stop (logind delay lock) and start again after.
+"""
+import asyncio
+import fcntl
+import importlib.util
+import math
+import os
+import struct
+import sys
+import time
+import zlib
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+_spec = importlib.util.spec_from_file_location("probe", os.path.join(HERE, "thor-imu-probe.py"))
+probe = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(probe)
+
+NAME = "Thor Motion Sensors"
+RATE = 200
+G = 9.80665
+RAD2DEG = 180.0 / math.pi
+ACCEL_RES, GYRO_RES = 8192, 1024
+ACCEL_RANGE, GYRO_RANGE = 4 * ACCEL_RES, 2048 * GYRO_RES
+ZERO_FILE = "/var/lib/thor-sensors/gyro-zero"
+ROT = ((0, -1, 0), (1, 0, 0), (0, 0, 1))  # controller = ROT * sensor
+
+# linux/input-event-codes.h, linux/uinput.h
+EV_SYN, EV_ABS, EV_MSC = 0, 3, 4
+SYN_REPORT, MSC_TIMESTAMP = 0, 5
+ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ = 0, 1, 2, 3, 4, 5
+INPUT_PROP_ACCELEROMETER = 6
+BUS_HOST = 0x19
+UI_SET_EVBIT, UI_SET_ABSBIT, UI_SET_MSCBIT, UI_SET_PROPBIT = 0x40045564, 0x40045567, 0x40045568, 0x4004556E
+UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+UI_DEV_SETUP = 0x405C5503   # struct uinput_setup: input_id(8) + name[80] + ff_effects_max(4)
+UI_ABS_SETUP = 0x401C5504   # struct uinput_abs_setup: code(2) + pad(2) + input_absinfo(24)
+
+
+def log(msg):
+    print(f"thor-motiond: {msg}", file=sys.stderr, flush=True)
+
+
+class DsuServer(asyncio.DatagramProtocol):
+    """Cemuhook DSU server (UDP 127.0.0.1:26760) for emulators' motion input
+    (Dolphin, Cemu, Citra/Azahar, Eden). Motion only: slot 0 is the Thor,
+    buttons and sticks stay zero (the emulators read those from the pad).
+
+    Frame: DSU accel in g with the device flat = (0, -1, 0), gyro pitch/yaw/
+    roll in deg/s, from the controller frame as (x, -z, -y), the mapping
+    MaSi's qcom-motion uses (and qcom-sdl-pad's flat default). Signs are not
+    hand-checked on the Thor yet: DSU_SIGN flips one axis each if a game says so.
+    """
+    PORT = 26760
+    VERSION = 1001
+    MSG_VERSION, MSG_PORTS, MSG_DATA = 0x100000, 0x100001, 0x100002
+    MAC = bytes.fromhex("0254484f5200")       # locally administered, "THOR"
+    DSU_SIGN = (1, 1, 1, 1, 1, 1)             # accel x y z, gyro pitch yaw roll
+
+    def __init__(self):
+        self.transport, self.clients, self.packet, self.server_id = None, {}, 0, int.from_bytes(os.urandom(4), "little")
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def _send(self, addr, msg_type, payload):
+        body = struct.pack("<I", msg_type) + payload
+        hdr = b"DSUS" + struct.pack("<HHII", self.VERSION, len(body), 0, self.server_id)
+        pkt = bytearray(hdr + body)
+        struct.pack_into("<I", pkt, 8, zlib.crc32(pkt) & 0xFFFFFFFF)
+        self.transport.sendto(bytes(pkt), addr)
+
+    def _slot(self, slot):
+        # slot, state (2 connected), model (2 full gyro), connection (1 USB), mac, battery (5 full)
+        if slot != 0:
+            return struct.pack("<BBBB6sB", slot, 0, 0, 0, bytes(6), 0)
+        return struct.pack("<BBBB6sB", 0, 2, 2, 1, self.MAC, 5)
+
+    def datagram_received(self, data, addr):
+        if len(data) < 20 or data[:4] != b"DSUC":
+            return
+        (msg_type,) = struct.unpack_from("<I", data, 16)
+        if msg_type == self.MSG_VERSION:
+            self._send(addr, msg_type, struct.pack("<H", self.VERSION))
+        elif msg_type == self.MSG_PORTS and len(data) >= 24:
+            (count,) = struct.unpack_from("<i", data, 20)
+            for slot in data[24:24 + max(0, min(count, 4))]:
+                self._send(addr, msg_type, self._slot(slot) + b"\0")
+        elif msg_type == self.MSG_DATA:
+            self.clients[addr] = time.monotonic()
+
+    def send_motion(self, accel_g, gyro_dps):
+        if not self.clients:
+            return
+        now = time.monotonic()
+        x, y, z = accel_g
+        wx, wy, wz = gyro_dps
+        s = self.DSU_SIGN
+        a = (s[0] * x, s[1] * -z, s[2] * -y)
+        w = (s[3] * wx, s[4] * -wz, s[5] * -wy)
+        self.packet = (self.packet + 1) & 0xFFFFFFFF
+        payload = (self._slot(0) + struct.pack("<BI", 1, self.packet) + bytes(4 + 4 + 12 + 6 + 6)
+                   + struct.pack("<Q", int(now * 1e6)) + struct.pack("<3f", *a) + struct.pack("<3f", *w))
+        for addr, seen in list(self.clients.items()):
+            if now - seen > 5.0:          # clients re-register about every second
+                del self.clients[addr]
+                continue
+            self._send(addr, self.MSG_DATA, payload)
+
+
+def rotate(v, scale):
+    return [scale * (r[0] * v[0] + r[1] * v[1] + r[2] * v[2]) for r in ROT]
+
+
+class MotionDevice:
+    def __init__(self):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_ABS)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_MSC)
+        fcntl.ioctl(self.fd, UI_SET_MSCBIT, MSC_TIMESTAMP)
+        fcntl.ioctl(self.fd, UI_SET_PROPBIT, INPUT_PROP_ACCELEROMETER)
+        for code, rng, res in ((ABS_X, ACCEL_RANGE, ACCEL_RES), (ABS_Y, ACCEL_RANGE, ACCEL_RES),
+                               (ABS_Z, ACCEL_RANGE, ACCEL_RES), (ABS_RX, GYRO_RANGE, GYRO_RES),
+                               (ABS_RY, GYRO_RANGE, GYRO_RES), (ABS_RZ, GYRO_RANGE, GYRO_RES)):
+            fcntl.ioctl(self.fd, UI_SET_ABSBIT, code)
+            # value, minimum, maximum, fuzz, flat, resolution
+            fcntl.ioctl(self.fd, UI_ABS_SETUP, struct.pack("<HH6i", code, 0, 0, -rng, rng, 0, 0, res))
+        # No vendor/product: nothing may mistake it for the gamepad (2020:3001).
+        setup = struct.pack("<HHHH80sI", BUS_HOST, 0, 0, 1, NAME.encode(), 0)
+        fcntl.ioctl(self.fd, UI_DEV_SETUP, setup)
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+
+    def emit(self, accel_g, gyro_dps):
+        t = time.time()
+        sec, usec = int(t), int((t % 1) * 1e6)
+        ev = b"".join(struct.pack("<qqHHi", sec, usec, EV_ABS, code, int(round(max(-rng, min(rng, v * res)))))
+                      for code, v, rng, res in zip((ABS_X, ABS_Y, ABS_Z), accel_g, (ACCEL_RANGE,) * 3, (ACCEL_RES,) * 3))
+        ev += b"".join(struct.pack("<qqHHi", sec, usec, EV_ABS, code, int(round(max(-rng, min(rng, v * res)))))
+                       for code, v, rng, res in zip((ABS_RX, ABS_RY, ABS_RZ), gyro_dps, (GYRO_RANGE,) * 3, (GYRO_RES,) * 3))
+        ev += struct.pack("<qqHHi", sec, usec, EV_MSC, MSC_TIMESTAMP, int(time.monotonic() * 1e6) & 0x7FFFFFFF)
+        ev += struct.pack("<qqHHi", sec, usec, EV_SYN, SYN_REPORT, 0)
+        try:
+            os.write(self.fd, ev)
+        except BlockingIOError:
+            pass
+
+    def close(self):
+        try:
+            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        finally:
+            os.close(self.fd)
+
+
+class GyroZero:
+    """Gyro zero (deg/s, controller frame) from half-second still windows:
+    the gyro steady AND gravity not moving (a slow steady turn moves gravity)."""
+
+    def __init__(self, path):
+        self.path, self.bias, self.learned, self.saved = path, [0.0, 0.0, 0.0], False, 0.0
+        try:
+            b = [float(x) for x in open(path).read().split()]
+            if len(b) == 3 and all(math.isfinite(x) for x in b):
+                self.bias = b
+        except (OSError, ValueError):
+            pass
+        self._reset()
+
+    def _reset(self):
+        self.n, self.sum, self.sq, self.amin, self.amax = 0, [0.0] * 3, [0.0] * 3, [0.0] * 3, [0.0] * 3
+
+    def add(self, w, a):
+        for i in range(3):
+            if abs(w[i]) > 6.0:
+                return self._reset()
+            self.sum[i] += w[i]
+            self.sq[i] += w[i] * w[i]
+            if self.n == 0 or a[i] < self.amin[i]: self.amin[i] = a[i]
+            if self.n == 0 or a[i] > self.amax[i]: self.amax[i] = a[i]
+            if self.amax[i] - self.amin[i] > 0.03:   # noise ~0.02 g
+                return self._reset()
+        self.n += 1
+        if self.n < RATE // 2:
+            return
+        mean = [s / self.n for s in self.sum]
+        if any(self.sq[i] / self.n - mean[i] ** 2 > 0.25 ** 2 for i in range(3)):
+            return self._reset()
+        self.bias = [0.8 * b + 0.2 * m for b, m in zip(self.bias, mean)] if self.learned else mean
+        self.learned = True
+        self._reset()
+        if time.monotonic() - self.saved >= 60:
+            self.saved = time.monotonic()
+            try:
+                with open(self.path + ".new", "w") as f:
+                    f.write("%.5f %.5f %.5f\n" % tuple(self.bias))
+                os.replace(self.path + ".new", self.path)
+            except OSError as e:
+                log(f"cannot save the gyro zero: {e}")
+
+
+# Emulators (the DSU feed) only, 2026-10-24: I saw the gyro "moving on its own" in Ocarina of Time 3D's aim. The
+# zero above learns only while the Thor lies still, never in the hands, and a warm IMU drifts; hand tremor also
+# reaches the aim as motion. In the hands: below DRIFT_DPS on every axis, a second offset follows what is left
+# (time constant DRIFT_TAU_S, capped at DRIFT_MAX); then rates under TIGHTEN_DPS are scaled down by how far under they
+# are (JoyShockMapper's "gyro tightening"), so a still hand gives a still aim and a real turn passes untouched.
+# The uinput device (InputPlumber -> Steam) keeps the plain zeroed values. 0 turns either part off.
+TIGHTEN_DPS = float(os.environ.get("THOR_GYRO_TIGHTEN", "1.0"))
+DRIFT_DPS = float(os.environ.get("THOR_GYRO_DRIFT", "1.0"))
+DRIFT_TAU_S, DRIFT_MAX = 8.0, 1.5
+
+
+class Steady:
+    def __init__(self):
+        self.d = [0.0, 0.0, 0.0]
+
+    def reset(self):
+        self.d = [0.0, 0.0, 0.0]
+
+    def __call__(self, w):
+        if DRIFT_DPS > 0 and all(abs(x - d) < DRIFT_DPS for x, d in zip(w, self.d)):
+            k = 1.0 / (RATE * DRIFT_TAU_S)
+            self.d = [max(-DRIFT_MAX, min(DRIFT_MAX, d + k * (x - d))) for x, d in zip(w, self.d)]
+        w = [x - d for x, d in zip(w, self.d)]
+        m = math.sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2])
+        if TIGHTEN_DPS > 0 and m < TIGHTEN_DPS:
+            w = [x * (m / TIGHTEN_DPS) for x in w]
+        return w
+
+
+class Motion:
+    def __init__(self, dump=False):
+        self.dump, self.dev, self.dsu, self.clients = dump, None, None, {}
+        self.accel = [0.0, 0.0, 1.0]
+        self.zero = GyroZero(ZERO_FILE)
+        self.steady = Steady()
+        self.asleep, self.n = False, 0
+        self.loop = asyncio.get_event_loop()
+
+    def start(self):
+        svc = probe.find_service(timeout=10.0)
+        if not svc:
+            return False
+        try:
+            for t in ("accel", "gyro"):
+                c = probe.Client(svc)
+                c.start(t, RATE)
+                c.s.setblocking(False)
+                self.clients[t] = c
+                self.loop.add_reader(c.s.fileno(), self.on_data, t)
+        except (RuntimeError, OSError) as e:
+            log(f"sensor hub not ready: {e}")
+            self.stop()
+            return False
+        log(f"streaming accel + gyro at {RATE} Hz from node {svc[0]} port {svc[1]}")
+        return True
+
+    def stop(self):
+        for c in self.clients.values():
+            try:
+                self.loop.remove_reader(c.s.fileno())
+                c.stop()
+            except OSError:
+                pass
+        self.clients = {}
+
+    def on_data(self, t):
+        c = self.clients.get(t)
+        if not c:
+            return
+        while True:
+            try:
+                m = c.recv()
+            except BlockingIOError:
+                return
+            except OSError as e:
+                log(f"{t}: {e}")
+                return
+            if not m or m[0] != "report":
+                continue
+            for v in probe.samples(m[1]):
+                if t == "accel":
+                    self.accel = rotate(v, 1.0 / G)
+                else:
+                    w = rotate(v, RAD2DEG)
+                    before = self.zero.bias
+                    self.zero.add(w, self.accel)
+                    if self.zero.bias is not before:
+                        self.steady.reset()   # a fresh still-window zero already holds the drift
+                    w = [x - b for x, b in zip(w, self.zero.bias)]
+                    self.n += 1
+                    if self.dump:
+                        if self.n % (RATE // 5) == 0:
+                            print("accel %+6.3f %+6.3f %+6.3f g   gyro %+8.2f %+8.2f %+8.2f deg/s   zero %s"
+                                  % (*self.accel, *w, " ".join("%+.2f" % b for b in self.zero.bias)), flush=True)
+                    else:
+                        if self.dev:
+                            self.dev.emit(self.accel, w)
+                        if self.dsu:
+                            self.dsu.send_motion(self.accel, self.steady(w))
+
+    async def watch_sleep(self):
+        """Sensors off before suspend, on after resume (logind delay lock)."""
+        try:
+            from dbus_next.aio import MessageBus
+            from dbus_next import BusType
+        except ImportError:
+            log("no dbus_next: sensors stay on during sleep")
+            return
+        bus = await MessageBus(bus_type=BusType.SYSTEM, negotiate_unix_fd=True).connect()
+        intro = await bus.introspect("org.freedesktop.login1", "/org/freedesktop/login1")
+        mgr = bus.get_proxy_object("org.freedesktop.login1", "/org/freedesktop/login1", intro) \
+                 .get_interface("org.freedesktop.login1.Manager")
+        lock = {"fd": None}
+
+        async def take():
+            if lock["fd"] is None:
+                lock["fd"] = await mgr.call_inhibit("sleep", "thor-motiond", "Turning the motion sensors off", "delay")
+
+        def release():
+            if lock["fd"] is not None:
+                os.close(lock["fd"]); lock["fd"] = None
+
+        def on_prepare(start):
+            if start:
+                log("suspending: motion sensors off")
+                self.asleep = True
+                self.stop()
+                release()
+            else:
+                self.asleep = False
+                self.loop.create_task(take())
+                self.loop.create_task(self.keep_streaming(delay=1.0))
+                log("resumed: motion sensors on")
+
+        mgr.on_prepare_for_sleep(on_prepare)
+        await take()
+
+    async def keep_streaming(self, delay=0.0):
+        await asyncio.sleep(delay)
+        while not self.asleep and not self.clients:
+            if self.start():
+                return
+            await asyncio.sleep(3)
+
+    async def health(self):
+        """Restart the streams if samples stop (sensor hub restarted)."""
+        last = -1
+        while True:
+            await asyncio.sleep(5)
+            if self.asleep:
+                continue
+            if self.n == last and self.clients:
+                log("no samples for 5 s: reconnecting")
+                self.stop()
+            last = self.n
+            if not self.clients:
+                await self.keep_streaming()
+
+
+async def main():
+    dump = "--dump" in sys.argv[1:]
+    m = Motion(dump)
+    if not dump:
+        m.dev = MotionDevice()
+        log(f"created uinput device \"{NAME}\"")
+        m.loop.create_task(m.watch_sleep())
+        _, m.dsu = await m.loop.create_datagram_endpoint(DsuServer, local_addr=("127.0.0.1", DsuServer.PORT))
+        log(f"DSU server on 127.0.0.1:{DsuServer.PORT}")
+    await m.keep_streaming()
+    try:
+        await m.health()
+    finally:
+        m.stop()
+        if m.dev:
+            m.dev.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

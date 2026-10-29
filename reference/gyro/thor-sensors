@@ -1,0 +1,89 @@
+#!/bin/bash
+# Thor motion sensors behind the ADSP's sensor hub (SSC): build the files the
+# ADSP's sensors process reads through hexagonrpcd. Our port of pb-os's
+# sm8550-sensors (upstream-pbos-d272791/sm8550-sensors, itself from MaSi's
+# SteamOS-ARM-SM8550 S28qcom-sensors), Thor only, paths overridable for tests.
+#
+#   thor-sensors check     is this an AYN Thor with the ADSP FastRPC node
+#   thor-sensors prepare   build $STATE/root and, once, the sensor registry
+#   thor-sensors run       prepare, then both hexagonrpcd listeners (foreground)
+#
+# $STATE/root is what the ADSP sees as Android's paths:
+#   sensors/config        AYN/Qualcomm Kailua stock sensor JSON ($SHARE/kailua)
+#   sensors/registry      made once by sscregistrygen; the ADSP adds what it
+#                         learns about this unit, so it is never replaced
+#   socinfo/              the selectors the stock config filters on
+#   dsp/adsp/             DSP libraries from AYN's stock firmware ($SHARE/thor)
+set -euo pipefail
+SHARE="${THOR_SENSORS_SHARE:-/usr/share/thor-sensors}"
+LIB="${THOR_SENSORS_LIB:-/usr/lib/thor-sensors}"
+STATE="${THOR_SENSORS_STATE:-/var/lib/thor-sensors}"
+CONFIG=$SHARE/kailua/sensors
+ROOT=$STATE/root
+MARKER=sh5001_0_platform.config   # the Thor's IMU profile exists = registry complete
+
+log() { echo "thor-sensors: $*" >&2; }
+
+check() {
+  tr '\0' '\n' </sys/firmware/devicetree/base/compatible | grep -qx 'ayn,thor' || { log "not an AYN Thor"; return 1; }
+  [[ -e /dev/fastrpc-adsp ]] || { log "no /dev/fastrpc-adsp (kernel without FastRPC sensors-PD)"; return 1; }
+}
+
+prepare() {
+  check
+  [[ -d "$CONFIG/config" ]] || { log "missing $CONFIG"; exit 1; }
+  # Audio shares the ADSP: let its sound card bind first (an ADSP restart
+  # after the sensors process opened FastRPC sessions is not reliably recovered).
+  udevadm wait --timeout=30 /sys/class/sound/card0 || log "no sound card yet, going on"
+  local reg=$STATE/registry tmp soc
+  mkdir -p "$reg"
+  if [[ ! -s "$reg/$MARKER" ]]; then
+    if [[ -n "$(ls -A "$reg")" ]]; then
+      log "the registry in $reg is incomplete; not replacing it (it may hold this unit's calibration)"
+      exit 1
+    fi
+    soc=$(tr -d '\0\r\n ' </sys/devices/soc0/soc_id 2>/dev/null || true)
+    tmp=$(mktemp -d "$STATE/registry.new.XXXX")
+    # The stock Thor registry is the Kailua HDK profile.
+    if ! "$LIB/sscregistrygen" -p HDK -s "${soc:-603}" "$CONFIG/config" "$tmp" >&2 || [[ ! -s "$tmp/$MARKER" ]]; then
+      rm -rf "$tmp"; log "could not make the sensor registry"; exit 1
+    fi
+    mv "$tmp"/* "$reg"/; rmdir "$tmp"
+    log "made the sensor registry in $reg"
+  fi
+  rm -rf "$ROOT"
+  mkdir -p "$ROOT/sensors" "$ROOT/dsp" "$ROOT/socinfo"
+  ln -s "$CONFIG/config" "$ROOT/sensors/config"
+  ln -s "$CONFIG/sns_reg.conf" "$ROOT/sensors/sns_reg.conf"
+  ln -s "$reg" "$ROOT/sensors/registry"
+  printf 'version=%s\0' "$(sed -n 's/^version=//p' "$CONFIG/sns_reg.conf" | head -n1)" >"$ROOT/sensors/sns_reg_version"
+  if [[ -d "$SHARE/thor/dsp/adsp" ]]; then ln -s "$SHARE/thor/dsp/adsp" "$ROOT/dsp/adsp"; else mkdir -p "$ROOT/dsp/adsp"; fi
+  local f
+  for f in soc_id revision machine family; do
+    [[ -r /sys/devices/soc0/$f ]] && tr -d '\0' </sys/devices/soc0/$f >"$ROOT/socinfo/$f"
+  done
+  echo HDK >"$ROOT/socinfo/hw_platform"
+  for f in platform_subtype platform_subtype_id platform_version; do echo 0 >"$ROOT/socinfo/$f"; done
+}
+
+SPID="" RPID=""
+run() {
+  prepare
+  # Line-buffered so a verbose build's trace reaches the journal as it happens.
+  local lb=(); command -v stdbuf >/dev/null && lb=(stdbuf -oL -eL)
+  trap '[[ -n "$SPID$RPID" ]] && kill $SPID $RPID 2>/dev/null' EXIT INT TERM
+  # The sensors process (-s) attaches first; the root process shares the node.
+  "${lb[@]}" "$LIB/hexagonrpcd" -f /dev/fastrpc-adsp -d adsp -s -R "$ROOT" &
+  SPID=$!
+  sleep 1
+  "${lb[@]}" "$LIB/hexagonrpcd" -f /dev/fastrpc-adsp -d adsp -R "$ROOT" &
+  RPID=$!
+  wait -n $SPID $RPID
+}
+
+case "${1:-}" in
+  check) check ;;
+  prepare) prepare ;;
+  run) run ;;
+  *) echo "usage: $0 check|prepare|run" >&2; exit 2 ;;
+esac

@@ -36,7 +36,7 @@ Everything this runs on was made by other people. This page lists each project, 
 | Project | By | License | In this repo | What I took or changed |
 |---|---|---|---|---|
 | [hexagonrpc](https://github.com/linux-msm/hexagonrpc) | linux-msm | GPL-3.0 | Used | `hexagonrpcd` serves the sensor process on the Thor's DSP. I build it on the Thor with pb-os's eight patches. Nothing of it is here. |
-| pb-os sensor pieces (`sm8550-sensors`, its hexagonrpc patches, `pbos-motiond`) | Project Barry | GPL-2.0 (pb-os) | Reference | My setup service is a port of `sm8550-sensors` and isn't in this repo. My probe ([thor-imu-probe.py](reference/gyro/thor-imu-probe.py)) sends the same sensor-hub messages as `pbos-motiond`, written from scratch. |
+| pb-os sensor pieces (`sm8550-sensors`, its hexagonrpc patches, `pbos-motiond`) | Project Barry | GPL-2.0 (pb-os). The hexagonrpc patches are GPL-3.0, like hexagonrpc. | Included: its eight hexagonrpc patches, unchanged, in [reference/gyro/hexagonrpc-patches/](reference/gyro/hexagonrpc-patches/), and my port of `sm8550-sensors` ([thor-sensors](reference/gyro/thor-sensors), GPL-2.0) | `thor-sensors` is `sm8550-sensors` made Thor-only, with overridable paths. My motion daemon and probe send the same sensor-hub messages as `pbos-motiond`, written from scratch in Python. `pbos-motiond` itself isn't here. |
 | Batocera's Thor notes | Batocera | n/a | Reference | The registry and start-order details for the sensor helpers. |
 | AYN's stock sensor configuration and DSP library | AYN | Proprietary | Not included | They come from the Thor's own firmware. Never redistribute them. |
 

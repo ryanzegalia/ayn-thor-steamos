@@ -20,7 +20,7 @@ The kernel my pb-os image first came with was pb-os's prebuilt one from 2026-10-
 |---|---|---|
 | **Rumble** that works on the Thor's linear resonant actuator (LRA) | On the first kernel boot of my build (`ff1`, 2026-10-19), my read-only health snapshot differed from the old kernel's in the haptics line (`use_erm no`, `vmax 1300`). I played three rumble pulses and they felt great to me. | Measured: `thor-kernel-check` diff between the two kernels. The feel is my own judgment, one session. |
 | A **charge stop** (hold the battery, ideally near 80%) | The old kernel had no charge-control files; `charge_control_end_threshold` accepted a write and read back 0. The recipe at `d272791` carries pb-os's patch 0545, which adds `retroid_charge_now` and `retroid_limit_capacity`. On my build, `retroid_charge_now 0` took the battery to 0 A while USB powered the Thor and `1` charged it again in about 2 seconds. `retroid_limit_capacity 1` stopped charging too. | Measured on the charger at 100%, 2026-10-19. |
-| The **kernel half of gyro** (FastRPC for the sensor hub) | On the old kernel `dmesg` said `no reserved DMA memory for FASTRPC` and the sensor hub never came up. On my build the health snapshot shows the FastRPC sensors process enabled, and with the userspace pieces in [gyro.md](gyro.md) the sensor hub streams. | Measured. What Steam does with the motion is not proven, see [gyro.md](gyro.md). |
+| The **kernel half of gyro** (FastRPC for the sensor hub) | On the old kernel `dmesg` said `no reserved DMA memory for FASTRPC` and the sensor hub never came up. On my build the health snapshot shows the FastRPC sensors process enabled, and with the userspace pieces in [gyro.md](gyro.md) the sensor hub streams and the gyro works in the 3DS emulator. | Measured. Steam Input doesn't use the gyro yet, see [gyro.md](gyro.md). |
 
 Two caveats on that table. The stop at exactly 80% over a full day was not proven (see "Not proven"). And I did not compare against a pb-os kernel newer than 2026-10-07 apart from building it, so I can't say what pb-os's current prebuilt does.
 
@@ -72,7 +72,7 @@ For 2006 to 2008 together: after installing ff6 I did 3 rtcwake deep-sleep cycle
 - **Holding the battery at exactly 80% for a whole day on the charger.** The stop mechanism works (charging stops and restarts on command, and I saw 0 A at 99% after a reboot), but I haven't run the full-day test.
 - **Holding 80% while the Thor is powered off.** It fails. I shut down at 88% on the charger and it booted at 99% with no boot in between. The bootloader or power chip charges a switched-off Thor to full. Only a running OS (awake, or Steam's Sleep on the charger) holds the limit.
 - **2005 to 2008 individually.** Running, not separately measured; the GPU hang fixes were never triggered.
-- **Gyro in a game.** The kernel half works. Motion in Steam or an emulator is not proven, see [gyro.md](gyro.md).
+- **Gyro through Steam Input.** The kernel half works, and the gyro reaches the 3DS emulator. Steam Input doesn't use it yet, see [gyro.md](gyro.md).
 - **Lid wake as a rate.** One run, not a repeated count.
 - **A cold boot of ff6.** I used warm reboots and sleep cycles.
 - **Whether pb-os's newer prebuilt kernel does any of this better.** I haven't run it.

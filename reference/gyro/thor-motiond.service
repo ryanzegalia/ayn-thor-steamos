@@ -1,0 +1,13 @@
+[Unit]
+Description=Thor motion sensors as "Thor Motion Sensors" (uinput, for InputPlumber) and a DSU server (emulators)
+After=thor-sensors.service
+BindsTo=thor-sensors.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/thor-sensors/thor-motiond
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=thor-sensors.service

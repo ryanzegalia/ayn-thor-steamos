@@ -10,7 +10,7 @@ You've been pointed at a research repo about the AYN Thor on SteamOS (an ARM Ste
 4. [docs/switch-pro-identity.md](docs/switch-pro-identity.md): the InputPlumber `switch-pro` target (patches in `reference/inputplumber/patches/`).
 5. [docs/per-game-layout.md](docs/per-game-layout.md): per-game Xbox/Nintendo layout and automatic Nintendo mode (FatterPad).
 6. [docs/thorlook.md](docs/thorlook.md): making Steam draw the Thor at runtime (Decky plugin, CSS).
-7. [docs/gyro.md](docs/gyro.md): reading the motion sensor. Only partly done.
+7. [docs/gyro.md](docs/gyro.md): reading the motion sensor and feeding emulators over DSU. Works in Azahar (3DS), not yet through Steam Input.
 8. [docs/gotchas.md](docs/gotchas.md).
 9. [docs/kernel.md](docs/kernel.md): the kernel build, every patch with its source and proof. The patches are in `reference/kernel/`.
 

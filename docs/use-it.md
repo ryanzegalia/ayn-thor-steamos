@@ -36,6 +36,10 @@ What I did on the Thor:
 4. Switched the identity with `fatterpad-abxy identity switch-pro`, or straight over D-Bus ([switch-pro-identity.md](switch-pro-identity.md)).
 5. Checked it with [thor-pro-probe](../reference/tools/thor-pro-probe) (expect `bound=nintendo` and a few hundred reports a second) and [thor-steam-pads](../reference/tools/thor-steam-pads) (expect `type=38 ... nintendo=True`).
 
+## Gyro for emulators
+
+What I did, in order: built my kernel ([kernel.md](kernel.md)), built `hexagonrpcd` on the Thor, installed the sensor helpers and the motion daemon, rebooted so the helpers attach early, checked the sensor hub, then pointed the emulators at the DSU feed. The files and steps are in [reference/gyro/README.md](../reference/gyro/README.md). AYN's own sensor files aren't in this repo. It works in Azahar (3DS) on my Thor, and I haven't confirmed Eden or Dolphin yet.
+
 ## The kernel
 
 See [kernel.md](kernel.md). It covers what each patch does, where it came from, how I built and swapped the kernel, and how to roll back.

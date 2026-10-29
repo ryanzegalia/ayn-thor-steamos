@@ -6,6 +6,7 @@ All Markdown files (README.md, CREDITS.md, AGENTS.md, docs/, and the README.md f
 
 art/tools/, reference/thorlook/, reference/fatterpad/, reference/tools/, reference/gyro/, and the scripts and tools in reference/kernel/:
   MIT, Copyright (c) 2026 Ryan Zegalia.
+  Exceptions in reference/gyro/: thor-sensors and thor-sensors.service are a port of pb-os's sm8550-sensors and are GPL-2.0; hexagonrpc-patches/ are pb-os's patches to hexagonrpc and are GPL-3.0.
   Exception: the Decky API connection block at the top of reference/thorlook/decky/index.template.js (and of the dist/index.js that build.py makes from it) and of reference/fatterpad/decky/dist/index.js comes from @decky/api (SteamDeckHomebrew/loader-api) and is LGPL-2.1.
 
 reference/inputplumber/patches/:

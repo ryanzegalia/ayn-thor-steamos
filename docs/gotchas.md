@@ -25,3 +25,5 @@ Things that cost me time, so they don't cost you any. Each one was seen on my Th
 
 - **Start the sensor helpers early in boot,** after the sound card appears. Attaching late never brought the sensor hub's service up until a reboot.
 - **The default handheld identity doesn't show gyro on Steam's test screen,** even with motion in its reports.
+- **The gyro's zero only learns while the Thor lies still.** In the hands, a warm sensor and tremor creep into an emulator's aim unless you filter them (my DSU feed does, [gyro.md](gyro.md)).
+- **An always-on 200 Hz stream in Python isn't free:** about 3.5% of a core on average on my Thor.

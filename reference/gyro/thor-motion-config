@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Point the Thor's SteamOS emulators that use motion at thor-motiond's DSU
+feed (127.0.0.1:26760, slot 0). Only SteamOS-side settings are touched:
+
+  azahar   ~/.var/app/org.azahar_emu.Azahar/config/azahar-emu/qt-config.ini
+           (SteamOS's own values; boundary row 43)
+  eden     ~/.config/eden/qt-config.ini (HOME, SteamOS only)
+  dolphin  Config/DSUClient.ini + Config/WiimoteNew.ini [Wiimote1] IMU lines:
+           per-OS pieces thor-emucfg keeps for SteamOS (boundary row 32);
+           during a SteamOS session the live files ARE SteamOS's values
+
+  thor-motion-config [--check] [azahar] [eden] [dolphin]   (default: all)
+
+An emulator that is running is skipped (it would write its config back on
+exit). Every changed file is backed up first, with SHA-256 before/after, in
+~/thor-backups/motion-config-<time>/.
+"""
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+DSU = ("127.0.0.1", 26760)
+EDEN_UDP = 'engine:cemuhookudp,motion:0,pad:0,port:26760,guid:0000000000000000000000007f000001'
+DOLPHIN_DEV = "DSUClient/0/Thor"
+DOLPHIN_IMU = [
+    ("IMUAccelerometer/Up", "Accel Up"), ("IMUAccelerometer/Down", "Accel Down"),
+    ("IMUAccelerometer/Left", "Accel Left"), ("IMUAccelerometer/Right", "Accel Right"),
+    ("IMUAccelerometer/Forward", "Accel Forward"), ("IMUAccelerometer/Backward", "Accel Backward"),
+    ("IMUGyroscope/Pitch Up", "Gyro Pitch Up"), ("IMUGyroscope/Pitch Down", "Gyro Pitch Down"),
+    ("IMUGyroscope/Roll Left", "Gyro Roll Left"), ("IMUGyroscope/Roll Right", "Gyro Roll Right"),
+    ("IMUGyroscope/Yaw Left", "Gyro Yaw Left"), ("IMUGyroscope/Yaw Right", "Gyro Yaw Right"),
+]
+FILES = {
+    "azahar": [f"{HOME}/.var/app/org.azahar_emu.Azahar/config/azahar-emu/qt-config.ini"],
+    "eden": [f"{HOME}/.config/eden/qt-config.ini"],
+    "dolphin": [f"{HOME}/.var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu/DSUClient.ini",
+                f"{HOME}/.var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu/WiimoteNew.ini"],
+}
+RUNNING = {"azahar": r"azahar", "eden": r"(^|/)eden(-cli|-duo)?( |$)|eden\.AppImage", "dolphin": r"dolphin-emu"}
+
+
+def running(emu):
+    out = subprocess.run(["ps", "-eo", "args="], capture_output=True, text=True).stdout
+    me = str(os.getpid())
+    return any(re.search(RUNNING[emu], line, re.I) and "thor-motion-config" not in line for line in out.splitlines())
+
+
+def sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest() if os.path.exists(path) else "absent"
+
+
+def qt_set(text, key, value):
+    """Set `key=value` and `key\\default=false` in a Qt ini (key may hold backslashes)."""
+    lines = text.split("\n")
+    out, seen, dseen = [], False, False
+    for line in lines:
+        if line.startswith(key + "="):
+            out.append(f"{key}={value}"); seen = True
+        elif line.startswith(key + "\\default="):
+            out.append(f"{key}\\default=false"); dseen = True
+        else:
+            out.append(line)
+    if not seen:
+        raise SystemExit(f"{key} not found; not adding keys to a section blindly")
+    if not dseen:
+        i = next(i for i, l in enumerate(out) if l.startswith(key + "="))
+        out.insert(i, f"{key}\\default=false")
+    return "\n".join(out)
+
+
+def qt_get(text, key):
+    m = re.search(r"^" + re.escape(key) + r"=(.*)$", text, re.M)
+    return m.group(1) if m else None
+
+
+def azahar(text):
+    return qt_set(text, "profiles\\1\\motion_device", '"engine:cemuhookudp"')
+
+
+def eden(text):
+    text = qt_set(text, "enable_udp_controller", "true")
+    text = qt_set(text, "udp_input_servers", f"{DSU[0]}:{DSU[1]}")
+    for side in ("motionleft", "motionright"):
+        text = qt_set(text, f"player_0_{side}", f'"{EDEN_UDP}"')
+    return text
+
+
+def dolphin_dsu(_text):
+    return f"[Server]\nEnabled = True\nEntries = Thor:{DSU[0]}:{DSU[1]};\n"
+
+
+def dolphin_wiimote(text):
+    lines = text.split("\n")
+    try:
+        start = lines.index("[Wiimote1]")
+    except ValueError:
+        raise SystemExit("WiimoteNew.ini has no [Wiimote1]")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("[")), len(lines))
+    body = [l for l in lines[start + 1:end] if not l.startswith(("IMUAccelerometer/", "IMUGyroscope/"))]
+    body += [f"{k} = `{DOLPHIN_DEV}:{v}`" for k, v in DOLPHIN_IMU]
+    return "\n".join(lines[:start + 1] + body + lines[end:])
+
+
+def check():
+    a = open(FILES["azahar"][0]).read()
+    e = open(FILES["eden"][0]).read()
+    print("azahar  motion_device =", qt_get(a, "profiles\\1\\motion_device"),
+          f"(udp {qt_get(a, 'profiles' + chr(92) + '1' + chr(92) + 'udp_input_address')}:{qt_get(a, 'profiles' + chr(92) + '1' + chr(92) + 'udp_input_port')})")
+    print("eden    enable_udp_controller =", qt_get(e, "enable_udp_controller"), " player_0_motionleft =", qt_get(e, "player_0_motionleft"))
+    d = open(FILES["dolphin"][0]).read().strip() or "(empty)"
+    w = open(FILES["dolphin"][1]).read()
+    print("dolphin DSUClient.ini:", d.replace("\n", " | "))
+    print("dolphin Wiimote1 IMU lines:", sum(1 for l in w.split("\n") if l.startswith(("IMUAccelerometer/", "IMUGyroscope/"))))
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if "--check" in sys.argv:
+        return check()
+    emus = args or ["azahar", "eden", "dolphin"]
+    bak = f"{HOME}/thor-backups/motion-config-{time.strftime('%Y%m%d-%H%M%S')}"
+    edits = {"azahar": [azahar], "eden": [eden], "dolphin": [dolphin_dsu, dolphin_wiimote]}
+    log = []
+    for emu in emus:
+        if running(emu):
+            print(f"{emu}: running, skipped (quit it and run again)")
+            continue
+        for path, fn in zip(FILES[emu], edits[emu]):
+            real = os.path.realpath(path)
+            old = open(real).read() if os.path.exists(real) else ""
+            new = fn(old)
+            if new == old:
+                print(f"{emu}: {os.path.basename(path)} already set")
+                continue
+            os.makedirs(bak, exist_ok=True)
+            if os.path.exists(real):
+                shutil.copy2(real, os.path.join(bak, f"{emu}-{os.path.basename(path)}"))
+            before = sha(real)
+            tmp = real + ".thor-motion.tmp"
+            with open(tmp, "w") as f:
+                f.write(new)
+            if os.path.exists(real):
+                try:
+                    shutil.copymode(real, tmp)
+                except OSError:
+                    pass  # exFAT (SHARED) has no per-file modes
+            os.replace(tmp, real)
+            log.append(f"{emu} {real} {before} -> {sha(real)}")
+            print(f"{emu}: {os.path.basename(path)} set (backup in {bak})")
+    if log:
+        with open(os.path.join(bak, "SHA256-before-after.txt"), "w") as f:
+            f.write("\n".join(log) + "\n")
+    check()
+
+
+if __name__ == "__main__":
+    main()
